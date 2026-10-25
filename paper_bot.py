@@ -44,9 +44,12 @@ FEEDS = [
 
 JOURNAL_FEEDS = {f["name"] for f in FEEDS if f["section"] == "journal"}
 
-# 中文顶刊：官网无 RSS，直接解析首页服务端渲染的当期目录
-# （中国工业经济=博渊星辰CMS，取 id 最大连续段即当期；数量经济=勤云CMS，file_no=YYYYMMNN 取最大年月组）
+# 中文顶刊：官网无 RSS，直接解析首页服务端渲染的当期目录或调用官方 API
+# （中国工业经济=博渊星辰CMS，取 id 最大连续段即当期；数量经济=勤云CMS，file_no=YYYYMMNN 取最大年月组；
+#   中国农村经济=ajcass 新平台 Vue CMS，官方 JSON API 可拿目录+逐篇摘要）
 CHINESE_SCRAPERS = [
+    {"name": "中国农村经济", "kind": "ajcass_vue", "site": "https://zgncjj.ajcass.com",
+     "journal_id": "201606270007", "cap": 8},
     {"name": "中国工业经济", "url": "https://ciejournal.ajcass.com", "kind": "cie", "cap": 8},
     {"name": "数量经济技术经济研究", "url": "https://www.jqte.net", "kind": "jqte", "cap": 8},
 ]
@@ -182,7 +185,51 @@ def scrape_jqte(feed: dict) -> list:
     return items[:feed["cap"]]
 
 
-SCRAPE_FUNCS = {"cie": scrape_cie, "jqte": scrape_jqte}
+def scrape_ajcass_vue(feed: dict) -> list:
+    """ajcass 新平台（如中国农村经济）：官方 JSON API，当期目录 + 逐篇摘要。"""
+    api = "https://api.ajcass.com/api/SiteWebApi"
+    headers = {"User-Agent": "Mozilla/5.0", "Content-Type": "application/json",
+               "Referer": feed["site"] + "/"}
+    req = urllib.request.Request(
+        f"{api}/GetCurrentPeriodMutiChannel?JournalID={feed['journal_id']}", headers=headers)
+    data = json.loads(urllib.request.urlopen(req, timeout=15).read().decode("utf-8"))
+    if data.get("code") != 200:
+        raise RuntimeError(f"目录接口返回 {data.get('code')}")
+    year, issue = data["data"]["year"], data["data"]["issue"]
+    items = []
+
+    def walk(chs):  # 栏目是嵌套树（专题栏目下还有子栏目），递归收集
+        for ch in chs or []:
+            for it in ch.get("issueInfoList") or []:
+                t = re.sub(r"\s+", " ", it.get("title") or "").strip()
+                if len(t) >= 8:
+                    items.append({"title": t, "id": it["id"],
+                                  "authors": (it.get("authors") or "").strip()})
+            walk(ch.get("channels"))
+
+    walk(data["data"].get("channels"))
+    items = items[:feed["cap"]]
+    for it in items:
+        try:
+            body = {"channelId": 0, "contentId": it["id"], "dataShowType": 1,
+                    "dataSourceType": 3, "issue": 0, "year": 0,
+                    "JournalID": feed["journal_id"]}
+            req = urllib.request.Request(f"{api}/GetContentInfo",
+                                         data=json.dumps(body).encode(), method="POST",
+                                         headers=headers)
+            resp = json.loads(urllib.request.urlopen(req, timeout=12).read().decode("utf-8"))
+            abs_raw = ((resp.get("data") or {}).get("issueContentInfoResult") or {}).get("abstract") or ""
+            it["desc"] = re.sub(r"<[^>]+>", "", abs_raw).strip()
+        except Exception:
+            it["desc"] = ""
+        time.sleep(0.2)
+    return [{"title": it["title"],
+             "link": f"{feed['site']}/#/issueDetail?contentId={it['id']}&year={year}&issue={issue}",
+             "dt": None, "desc": it["desc"], "authors": it["authors"]}
+            for it in items]
+
+
+SCRAPE_FUNCS = {"cie": scrape_cie, "jqte": scrape_jqte, "ajcass_vue": scrape_ajcass_vue}
 
 
 def fetch_all_papers() -> list:
@@ -231,7 +278,7 @@ def build_paper_card(all_items: list, now: datetime) -> dict:
         # 带日期的源（AgEcon）过滤一周前的旧条目，防止旧文献新上传刷屏
         if it.get("dt") and it["dt"] < now - timedelta(days=7):
             continue
-        authors = ""
+        authors = (it.get("authors") or "").strip()  # ajcass_vue API 直接提供作者
         abstract = clean_title(it.get("desc") or "")
         if it["section"] == "nber":
             title, authors = split_nber(title)
