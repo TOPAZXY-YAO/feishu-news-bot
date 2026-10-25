@@ -1,0 +1,11 @@
+{
+  "webhook_url": "填入你的 Webhook 地址（或用环境变量 FEISHU_WEBHOOK_URL 注入）",
+  "secret": "填入签名密钥（或用环境变量 FEISHU_SECRET 注入）",
+  "hours_lookback": 24,
+  "max_per_category": 8,
+  "max_other": 4,
+  "feeds": [
+    { "name": "华尔街见闻", "url": "https://dedicated.wallstreetcn.com/rss.xml", "lang": "zh", "bias": "" },
+    { "name": "WSJ", "url": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml", "lang": "en", "bias": "global" }
+  ]
+}

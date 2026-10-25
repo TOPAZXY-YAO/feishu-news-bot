@@ -1,0 +1,51 @@
+name: daily-finance-news
+
+on:
+  schedule:
+    - cron: "56 23 * * *" # 北京时间 07:56，避开整点高峰降低排队延迟
+  workflow_dispatch:
+    inputs:
+      test_only:
+        description: "只发测试卡片（不推新闻）"
+        type: boolean
+        default: false
+
+concurrency:
+  group: daily-finance-news
+  cancel-in-progress: false
+
+permissions:
+  contents: write # 允许回写去重状态 state.json
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 推送财经早报
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+        run: |
+          if [ "${{ inputs.test_only }}" = "true" ]; then
+            python feishu_news.py --test
+          else
+            python feishu_news.py
+          fi
+
+      - name: 持久化去重状态
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "去重状态无变化，跳过提交"
+          else
+            git commit -m "chore: update dedup state"
+            git push
+          fi

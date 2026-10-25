@@ -1,0 +1,5 @@
+# 密钥与本地状态不入库
+config.json
+state.json
+logs/
+__pycache__/
