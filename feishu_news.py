@@ -117,6 +117,7 @@ def parse_feed(data: bytes) -> list:
             le = it.find(f"{ATOM}link")
             link = le.get("href") if le is not None else ""
         date_raw = it.findtext("pubDate") or it.findtext(f"{ATOM}updated") or it.findtext(f"{ATOM}published") or ""
+        desc = (it.findtext("description") or it.findtext(f"{ATOM}summary") or "").strip()
         dt = None
         if date_raw:
             try:
@@ -129,7 +130,8 @@ def parse_feed(data: bytes) -> list:
         if dt is not None and dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone(timedelta(hours=8)))  # 中文源默认北京时间
         if title and link:
-            items.append({"title": re.sub(r"\s+", " ", title), "link": link.strip(), "dt": dt})
+            items.append({"title": re.sub(r"\s+", " ", title), "link": link.strip(),
+                          "dt": dt, "desc": desc})
     return items
 
 

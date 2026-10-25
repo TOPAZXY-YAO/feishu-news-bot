@@ -31,6 +31,7 @@ jobs:
         env:
           PAPER_WEBHOOK_URL: ${{ secrets.PAPER_WEBHOOK_URL }}
           PAPER_SECRET: ${{ secrets.PAPER_SECRET }}
+          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
         run: |
           if [ "${{ inputs.test_only }}" = "true" ]; then
             python paper_bot.py --test

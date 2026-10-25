@@ -11,8 +11,12 @@
 """
 import argparse
 import json
+import os
 import re
 import sys
+import time
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -21,6 +25,10 @@ import feishu_news as news
 BASE = Path(__file__).resolve().parent
 STATE_FILE = BASE / "paper_state.json"
 WEEKDAYS = "一二三四五六日"
+
+ZHIPU_KEY = os.environ.get("ZHIPU_API_KEY", "")
+LLM_MODELS = ["glm-4-flash-250414", "glm-4.7-flash", "glm-4.5-flash"]  # 与对话机器人同款回退链
+SUMMARY_BUDGET_SECONDS = 240  # 概括阶段总预算，超时后剩余条目不再概括
 
 # section: nber / journal / agecon / arxiv；cap 为每次推送每板块上限
 FEEDS = [
@@ -33,6 +41,8 @@ FEEDS = [
     {"name": "arXiv econ.GN", "url": "http://export.arxiv.org/rss/econ.GN", "section": "arxiv", "cap": 2},
     {"name": "arXiv q-fin", "url": "http://export.arxiv.org/rss/q-fin", "section": "arxiv", "cap": 2},
 ]
+
+JOURNAL_FEEDS = {f["name"] for f in FEEDS if f["section"] == "journal"}
 
 SECTION_META = [
     ("nber", "NBER 工作论文", "📚"),
@@ -55,6 +65,52 @@ def split_nber(title: str):
     if m:
         return m.group(1).strip(), m.group(2).strip()
     return title, ""
+
+
+# ---------- AI 论文概括 ----------
+
+def zhipu_summarize(title: str, abstract: str = "") -> str:
+    """用智谱免费模型把论文概括成一句中文（45字内）。失败返回空串，不影响推送。"""
+    if not ZHIPU_KEY:
+        return ""
+    if abstract:
+        prompt = ("你是经济学研究助理。用一句不超过45字的中文概括这篇论文研究什么、核心发现是什么。"
+                  "直接输出概括本身，不要前缀、引号或评论。\n"
+                  f"标题：{title}\n摘要：{abstract[:1500]}")
+    else:
+        prompt = ("你是经济学研究助理。仅根据标题用一句不超过40字的中文概括这篇论文的研究方向。"
+                  "无法确定具体结论时只说大致主题，不要编造。直接输出概括本身。\n"
+                  f"标题：{title}")
+    last_err = None
+    for model in LLM_MODELS:
+        for attempt in range(2):
+            try:
+                body = {"model": model, "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.3, "max_tokens": 120,
+                        "thinking": {"type": "disabled"}}
+                req = urllib.request.Request(
+                    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+                    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                    headers={"Authorization": f"Bearer {ZHIPU_KEY}",
+                             "Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                out = (data["choices"][0]["message"].get("content") or "").strip()
+                return re.sub(r"\s+", " ", out)[:80]
+            except urllib.error.HTTPError as e:
+                last_err = f"HTTP {e.code}"
+                if e.code == 401:
+                    news.log(f"概括失败：智谱 Key 无效")
+                    return ""
+                if e.code == 429 and attempt < 1:
+                    time.sleep(2)
+                    continue
+                break
+            except Exception as e:
+                last_err = e
+                break
+    news.log(f"概括失败（{title[:30]}…）：{last_err}")
+    return ""
 
 
 # ---------- 去重状态（独立于新闻机器人） ----------
@@ -109,13 +165,36 @@ def build_paper_card(all_items: list, now: datetime) -> dict:
         if it.get("dt") and it["dt"] < now - timedelta(days=7):
             continue
         authors = ""
+        abstract = clean_title(it.get("desc") or "")
         if it["section"] == "nber":
             title, authors = split_nber(title)
+        elif it["src"] in JOURNAL_FEEDS:
+            # Elsevier 的 description 是元数据：没有摘要，但含作者，提出来用
+            m = re.search(r"Author\(s\):\s*([^<]+)", it.get("desc") or "")
+            if m:
+                authors = m.group(1).strip()
+            abstract = ""
         kept_links.add(link)
         sec = it["section"]
         if feed_counts.get(it["src"], 0) < it["cap"]:
             feed_counts[it["src"]] = feed_counts.get(it["src"], 0) + 1
-            sections[sec].append((title, link, authors))
+            sections[sec].append({"title": title, "link": link,
+                                  "authors": authors, "abstract": abstract})
+
+    # AI 概括阶段：只概括入选条目，带总时间预算，超时/失败自动降级为无概括
+    if ZHIPU_KEY:
+        deadline = time.time() + SUMMARY_BUDGET_SECONDS
+        n_sum = 0
+        for key, _, _ in SECTION_META:
+            for item in sections[key]:
+                if time.time() > deadline:
+                    news.log("概括阶段超预算，剩余条目跳过概括")
+                    break
+                item["summary"] = zhipu_summarize(item["title"], item["abstract"])
+                if item["summary"]:
+                    n_sum += 1
+                time.sleep(0.3)  # 轻微间隔，降低免费档限流概率
+        news.log(f"AI 概括完成：{n_sum} 条")
 
     date_str = f"{now.year}年{now.month}月{now.day}日 周{WEEKDAYS[now.weekday()]}"
     elements, total = [], 0
@@ -125,9 +204,13 @@ def build_paper_card(all_items: list, now: datetime) -> dict:
             continue
         total += len(items)
         lines = [f"**{icon} {name}**"]
-        for title, link, authors in items:
-            suffix = f"（{authors}）" if authors else ""
-            lines.append(f"- [{title}]({link}){suffix}")
+        for item in items:
+            line = f"- [{item['title']}]({item['link']})"
+            if item.get("authors"):
+                line += f"（{item['authors']}）"
+            if item.get("summary"):
+                line += f"\n  ↳ {item['summary']}"
+            lines.append(line)
         elements.append({"tag": "markdown", "content": "\n".join(lines)})
         elements.append({"tag": "hr"})
 
@@ -139,7 +222,7 @@ def build_paper_card(all_items: list, now: datetime) -> dict:
     elements.append({
         "tag": "note",
         "elements": [{"tag": "plain_text",
-                      "content": f"共 {total} 篇 ｜ 来源：NBER · Elsevier · AgEcon · arXiv ｜ 每日 08:30 自动推送"}],
+                      "content": f"共 {total} 篇 ｜ 来源：NBER · Elsevier · AgEcon · arXiv ｜ ↳ 为 AI 概括（智谱GLM）｜ 每日 08:30 自动推送"}],
     })
 
     return {
