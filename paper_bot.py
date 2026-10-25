@@ -44,9 +44,17 @@ FEEDS = [
 
 JOURNAL_FEEDS = {f["name"] for f in FEEDS if f["section"] == "journal"}
 
+# 中文顶刊：官网无 RSS，直接解析首页服务端渲染的当期目录
+# （中国工业经济=博渊星辰CMS，取 id 最大连续段即当期；数量经济=勤云CMS，file_no=YYYYMMNN 取最大年月组）
+CHINESE_SCRAPERS = [
+    {"name": "中国工业经济", "url": "https://ciejournal.ajcass.com", "kind": "cie", "cap": 8},
+    {"name": "数量经济技术经济研究", "url": "http://www.jqte.net", "kind": "jqte", "cap": 8},
+]
+
 SECTION_META = [
     ("nber", "NBER 工作论文", "📚"),
     ("journal", "期刊最新发表", "📖"),
+    ("cnjournal", "中文顶刊", "📜"),
     ("agecon", "AgEcon 农经文库", "🌾"),
     ("arxiv", "arXiv 预印本", "🧮"),
 ]
@@ -69,7 +77,7 @@ def split_nber(title: str):
 
 # ---------- AI 论文概括 ----------
 
-def zhipu_summarize(title: str, abstract: str = "") -> str:
+def zhipu_summarize(title: str, abstract: str = "", zh: bool = False) -> str:
     """用智谱免费模型把论文概括成一句中文（45字内）。失败返回空串，不影响推送。"""
     if not ZHIPU_KEY:
         return ""
@@ -77,6 +85,10 @@ def zhipu_summarize(title: str, abstract: str = "") -> str:
         prompt = ("你是经济学研究助理。用一句不超过45字的中文概括这篇论文研究什么、核心发现是什么。"
                   "直接输出概括本身，不要前缀、引号或评论。\n"
                   f"标题：{title}\n摘要：{abstract[:1500]}")
+    elif zh:
+        prompt = ("你是经济学研究助理。用一句不超过35字的中文大白话说明这篇中文论文研究什么问题、"
+                  "为什么重要，不要照抄标题字面。直接输出概括本身。\n"
+                  f"标题：{title}")
     else:
         prompt = ("你是经济学研究助理。仅根据标题用一句不超过40字的中文概括这篇论文的研究方向。"
                   "无法确定具体结论时只说大致主题，不要编造。直接输出概括本身。\n"
@@ -131,6 +143,48 @@ def save_state(state: dict) -> None:
 
 # ---------- 卡片 ----------
 
+# ---------- 中文期刊抓取 ----------
+
+def scrape_cie(feed: dict) -> list:
+    """中国工业经济（博渊星辰CMS）：首页当期目录是 id 最大且连续的 /Magazine/Show 链接块。"""
+    html = news.http_get(feed["url"]).decode("utf-8", errors="replace")
+    pairs = re.findall(r'/Magazine/Show\?id=(\d+)[^>]*>\s*([^<]{5,80})', html)
+    if not pairs:
+        raise RuntimeError("首页未找到文章链接（结构可能已变更）")
+    max_id = max(int(a) for a, _ in pairs)
+    items, seen = [], set()
+    for aid, title in pairs:
+        if int(aid) >= max_id - 40 and aid not in seen:
+            seen.add(aid)
+            t = re.sub(r"\s+", " ", title).strip()
+            if len(t) >= 8:
+                items.append({"title": t, "link": f"{feed['url']}/Magazine/Show?id={aid}",
+                              "dt": None, "desc": ""})
+    return items[:feed["cap"]]
+
+
+def scrape_jqte(feed: dict) -> list:
+    """数量经济技术经济研究（勤云CMS）：file_no=YYYYMMNN，取最大年月组即当期目录。"""
+    html = news.http_get(feed["url"]).decode("utf-8", errors="replace")
+    pairs = re.findall(r'view_abstract\.aspx\?file_no=(\d+)[^"\']*["\'][^>]*>\s*([^<]{5,80})', html)
+    if not pairs:
+        raise RuntimeError("首页未找到文章链接（结构可能已变更）")
+    latest = max(f[:6] for f, _ in pairs)  # YYYYMM
+    items, seen = [], set()
+    for fno, title in pairs:
+        if fno[:6] == latest and fno not in seen:
+            seen.add(fno)
+            t = re.sub(r"\s+", " ", title).strip()
+            if len(t) >= 8:
+                items.append({"title": t,
+                              "link": f"{feed['url']}/reader/view_abstract.aspx?file_no={fno}&flag=1",
+                              "dt": None, "desc": ""})
+    return items[:feed["cap"]]
+
+
+SCRAPE_FUNCS = {"cie": scrape_cie, "jqte": scrape_jqte}
+
+
 def fetch_all_papers() -> list:
     all_items = []
     for feed in FEEDS:
@@ -140,8 +194,21 @@ def fetch_all_papers() -> list:
                 it["section"] = feed["section"]
                 it["cap"] = feed["cap"]
                 it["src"] = feed["name"]
+                it["zh"] = False
             all_items.extend(items)
             news.log(f"源 {feed['name']}: 获取 {len(items)} 条")
+        except Exception as e:
+            news.log(f"源 {feed['name']} 失败（跳过）: {e}")
+    for feed in CHINESE_SCRAPERS:
+        try:
+            items = SCRAPE_FUNCS[feed["kind"]](feed)
+            for it in items:
+                it["section"] = "cnjournal"
+                it["cap"] = feed["cap"]
+                it["src"] = feed["name"]
+                it["zh"] = True
+            all_items.extend(items)
+            news.log(f"源 {feed['name']}: 获取 {len(items)} 条（当期目录）")
         except Exception as e:
             news.log(f"源 {feed['name']} 失败（跳过）: {e}")
     return all_items
@@ -179,7 +246,8 @@ def build_paper_card(all_items: list, now: datetime) -> dict:
         if feed_counts.get(it["src"], 0) < it["cap"]:
             feed_counts[it["src"]] = feed_counts.get(it["src"], 0) + 1
             sections[sec].append({"title": title, "link": link,
-                                  "authors": authors, "abstract": abstract})
+                                  "authors": authors, "abstract": abstract,
+                                  "zh": it.get("zh", False)})
 
     # AI 概括阶段：只概括入选条目，带总时间预算，超时/失败自动降级为无概括
     if ZHIPU_KEY:
@@ -190,7 +258,8 @@ def build_paper_card(all_items: list, now: datetime) -> dict:
                 if time.time() > deadline:
                     news.log("概括阶段超预算，剩余条目跳过概括")
                     break
-                item["summary"] = zhipu_summarize(item["title"], item["abstract"])
+                item["summary"] = zhipu_summarize(item["title"], item["abstract"],
+                                                  zh=item.get("zh", False))
                 if item["summary"]:
                     n_sum += 1
                 time.sleep(0.3)  # 轻微间隔，降低免费档限流概率
@@ -222,7 +291,7 @@ def build_paper_card(all_items: list, now: datetime) -> dict:
     elements.append({
         "tag": "note",
         "elements": [{"tag": "plain_text",
-                      "content": f"共 {total} 篇 ｜ 来源：NBER · Elsevier · AgEcon · arXiv ｜ ↳ 为 AI 概括（智谱GLM）｜ 每日 08:30 自动推送"}],
+                      "content": f"共 {total} 篇 ｜ 来源：NBER · Elsevier · 中文顶刊 · AgEcon · arXiv ｜ ↳ 为 AI 概括（智谱GLM）｜ 每日 08:30 自动推送"}],
     })
 
     return {
