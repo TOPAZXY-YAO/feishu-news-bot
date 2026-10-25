@@ -32,7 +32,9 @@ APP_ID = os.environ.get("FEISHU_APP_ID", "")
 APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 ZHIPU_KEY = os.environ.get("ZHIPU_API_KEY", "")
 
-LLM_MODELS = ["glm-4.7-flash", "glm-4.5-flash", "glm-4-flash-250414"]  # 依次回退
+# 实测（2026-10-26 凌晨）：glm-4.7-flash 免费档持续 429 限流，glm-4-flash-250414
+# 稳定且快（471字/6.4s、零限流），故将其提为主力，新模型作备份
+LLM_MODELS = ["glm-4-flash-250414", "glm-4.7-flash", "glm-4.5-flash"]
 LIFETIME_MINUTES = int(os.environ.get("LIFETIME_MINUTES", "310"))  # 主动续命点，低于 job 硬超时
 STABLE_MINUTES = 10  # 运行超过该时长才算"稳定过"，崩溃时才续命
 
@@ -133,27 +135,50 @@ def patch_message(api: lark.Client, message_id: str, text: str) -> bool:
 
 # ---------- 智谱 GLM ----------
 
-def zhipu_chat(messages: list) -> str:
+def zhipu_chat(messages: list, on_update=None) -> str:
+    """流式调用智谱；on_update(已生成全文) 约每 1.5 秒回调一次，用于消息增量更新。"""
     last_err = None
     for model in LLM_MODELS:
-        for attempt in range(3):  # 免费档限流(429)时同模型退避重试
+        for attempt in range(2):  # 429 只快速重试一次，尽快换下一个模型
             try:
                 body = {
                     "model": model, "messages": messages,
-                    "temperature": 0.6, "max_tokens": 2048,
-                    "thinking": {"type": "disabled"},  # 关闭思考模式，直接给答案
+                    "temperature": 0.6, "max_tokens": 1024,
+                    "thinking": {"type": "disabled"},
+                    "stream": True,
                 }
                 req = urllib.request.Request(
                     "https://open.bigmodel.cn/api/paas/v4/chat/completions",
                     data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                     headers={"Authorization": f"Bearer {ZHIPU_KEY}",
                              "Content-Type": "application/json"})
+                chunks, last_cb = [], 0.0
                 with urllib.request.urlopen(req, timeout=90) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                answer = (data["choices"][0]["message"].get("content") or "").strip()
-                if not answer:
-                    answer = "（这次思考太久了没写出答案，再问一次试试）"
-                return answer
+                    for raw in resp:
+                        line = raw.decode("utf-8", errors="replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(payload)
+                        except Exception:
+                            continue
+                        try:
+                            delta = obj["choices"][0].get("delta", {}).get("content") or ""
+                        except Exception:
+                            delta = ""
+                        if delta:
+                            chunks.append(delta)
+                            if on_update and time.time() - last_cb >= 1.5:
+                                on_update("".join(chunks))
+                                last_cb = time.time()
+                answer = "".join(chunks).strip()
+                if answer:
+                    return answer
+                last_err = "空回复"
+                break  # 空回复，换下一个模型
             except urllib.error.HTTPError as e:
                 detail = ""
                 try:
@@ -164,10 +189,10 @@ def zhipu_chat(messages: list) -> str:
                 log(f"模型 {model} 失败(第{attempt + 1}次): {last_err}")
                 if e.code == 401:
                     raise RuntimeError("智谱 API Key 无效（401），请检查 ZHIPU_API_KEY")
-                if e.code == 429 and attempt < 2:
-                    time.sleep(2 * (attempt + 1))
+                if e.code == 429 and attempt < 1:
+                    time.sleep(2)
                     continue
-                break  # 其他错误换下一个模型
+                break  # 其他错误/重试耗尽，换下一个模型
             except Exception as e:
                 last_err = e
                 log(f"模型 {model} 异常: {e}")
@@ -179,8 +204,8 @@ def system_prompt() -> str:
     now = datetime.now(timezone(timedelta(hours=8)))
     lines = [
         "你是飞书里的财经助手「小财」，服务一位关注 A股、全球市场与行业动态的个人投资者。",
-        "要求：中文回答；简洁直接、分点表述；给观点时说明依据；涉及行情预测时提示风险；",
-        "不确定的数据不要编造，坦诚说明。聊天内容可能很随意，不必总往财经上靠。",
+        "要求：中文回答；先给结论再展开，精炼为主（一般 300 字以内）；给观点时说明依据；",
+        "涉及行情预测时提示风险；不确定的数据不要编造，坦诚说明。聊天内容可能很随意，不必总往财经上靠。",
         f"今天是 {now.strftime('%Y年%m月%d日 %A')}。",
     ]
     if HEADLINES:
@@ -201,7 +226,7 @@ def fetch_headlines() -> None:
             if it["title"] not in seen:
                 seen.add(it["title"])
                 titles.append(it["title"])
-        HEADLINES = titles[:15]
+        HEADLINES = titles[:8]
         log(f"已加载 {len(HEADLINES)} 条要闻标题作为对话背景")
     except Exception as e:
         log(f"加载要闻失败（不影响对话）: {e}")
@@ -227,15 +252,22 @@ def ai_reply(api: lark.Client, chat_id: str, message_id: str, text: str) -> None
             "text": "AI 对话还没配置：需要在仓库 Secrets 里设置 ZHIPU_API_KEY。\n指令「早报」「帮助」目前可用。"})
         return
 
-    # 先秒回占位消息，AI 出结果后原地更新为答案，体感零等待
+    # 先秒回占位消息，AI 流式生成过程中逐段更新它，出结果后原地替换为完整答案
     placeholder_id = send_reply(api, message_id, "text", {"text": "💭 思考中…"})
+
+    def on_update(partial: str) -> None:
+        if placeholder_id:
+            try:
+                patch_message(api, placeholder_id, partial)
+            except Exception:
+                pass  # 增量更新失败不影响最终结果
 
     with HISTORY_LOCK:
         history = HISTORY.setdefault(chat_id, [])
         history.append({"role": "user", "content": text})
         msgs = [{"role": "system", "content": system_prompt()}] + history[-HISTORY_LIMIT:]
     try:
-        answer = zhipu_chat(msgs)
+        answer = zhipu_chat(msgs, on_update=on_update)
     except Exception as e:
         with HISTORY_LOCK:
             history.pop()
