@@ -4,6 +4,17 @@
 
 **当前主用：GitHub Actions 云端推送**（`.github/workflows/daily.yml`）——定时任务跑在 GitHub 服务器上，与本机开关机无关，手机/任何设备登录飞书都能收到。密钥通过仓库 Secrets（`FEISHU_WEBHOOK_URL`、`FEISHU_SECRET`）注入，不入库。
 
+## 对话机器人（AI 聊天 + 指令）
+
+`chat_bot.py` + `.github/workflows/chat-keepalive.yml`：飞书自建应用通过**长连接**接收消息，在 GitHub Actions 上 24/7 常驻（每约 5 小时自动续命重启，每日 03:00 定时兜底拉起）。
+
+- 💬 直接发消息 —— 智谱 GLM Flash（免费模型）回答，财经助手人设 + 近期要闻背景
+- 🌅 发「早报」—— 立即推送一期最新财经早报
+- ❓ 发「帮助」—— 指令说明
+- 单聊直接说；群聊需 @机器人（AI 对话的上下文在重启后清空）
+
+密钥：`FEISHU_APP_ID`、`FEISHU_APP_SECRET`（自建应用凭证）、`ZHIPU_API_KEY`（bigmodel.cn）。
+
 也可切换回本地模式：Windows 计划任务 `FeishuNewsBot`（见下文「注册每日定时任务」），密钥放在本地 `config.json`。
 
 ## 推送内容

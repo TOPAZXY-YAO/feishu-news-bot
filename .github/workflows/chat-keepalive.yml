@@ -1,0 +1,37 @@
+name: chat-keepalive
+
+on:
+  workflow_dispatch:           # 手动启动/续命链入口
+  schedule:
+    - cron: "0 19 * * *"       # 北京时间 03:00，兜底：链断了每天重新拉起
+
+concurrency:
+  group: chat-keepalive
+  cancel-in-progress: true     # 手动/兜底触发时替换旧运行
+
+permissions:
+  contents: read   # checkout
+  actions: write   # 允许脚本通过 API 触发下一次运行（链式续命）
+
+jobs:
+  chat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330   # 硬超时；脚本在 310 分钟时主动续命退出
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 运行对话机器人（长连接）
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LIFETIME_MINUTES: "310"
+        run: python chat_bot.py
