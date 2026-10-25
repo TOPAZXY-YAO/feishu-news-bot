@@ -24,7 +24,9 @@
 - 🌾 AgEcon 农经文库（过滤一周前旧条目）
 - 🧮 arXiv econ.GN + q-fin 预印本
 
-密钥：`PAPER_WEBHOOK_URL`、`PAPER_SECRET`；去重状态 `paper_state.json` 每日回写。中文期刊（经济研究/管理世界等）官网无稳定接口，暂未纳入，找到稳定通道后在 FEEDS/抓取器中扩展。
+每篇论文附一句中文 AI 概括（↳ 行，智谱 GLM 生成）：NBER/AgEcon/arXiv 基于摘要概括（较准确），Elsevier 期刊 RSS 无摘要、基于标题概括并自动提取作者；概括阶段有总时间预算，超时或失败自动降级为纯标题。
+
+密钥：`PAPER_WEBHOOK_URL`、`PAPER_SECRET`、`ZHIPU_API_KEY`；去重状态 `paper_state.json` 每日回写。中文期刊（经济研究/管理世界等）官网无稳定接口，暂未纳入，找到稳定通道后在 FEEDS/抓取器中扩展。
 
 也可切换回本地模式：Windows 计划任务 `FeishuNewsBot`（见下文「注册每日定时任务」），密钥放在本地 `config.json`。
 
