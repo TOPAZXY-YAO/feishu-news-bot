@@ -21,7 +21,7 @@
 
 - 📚 NBER 工作论文（带作者）
 - 📖 期刊最新发表：发展经济学 JDE / 中国经济评论 / 城市经济学 JUE / World Development（Elsevier RSS，刊列表在 `paper_bot.py` 的 FEEDS 里可增删，任意刊改 ISSN 即可）
-- 📜 中文顶刊：《中国农村经济》✓（ajcass 新平台官方 JSON API，**带完整中文摘要**，AI 概括最准）；《中国工业经济》✓（官网首页当期目录解析）；《数量经济技术经济研究》已适配但官网屏蔽海外机房 IP（502），每日自动重试，解封即恢复；经济研究/管理世界官网长期不可达未纳入。新增 ajcass 新平台期刊：在 `CHINESE_SCRAPERS` 加 `kind: ajcass_vue` 条目+对应 JournalID；博渊星辰/勤云 CMS 期刊可复用 `scrape_cie`/`scrape_jqte`
+- 📜 中文顶刊：《经济研究》✓（erj.ajcass 新平台，官方 API，**带完整摘要**）；《中国农村经济》✓（ajcass 新平台官方 JSON API，带完整中文摘要）；《中国工业经济》✓（官网首页当期目录解析）；《管理世界》《数量经济技术经济研究》已完整适配并本地验证，但官网屏蔽海外机房 IP（超时/502，jina 中转亦不可达），每日自动重试、解封即自动上线。新增 ajcass 新平台期刊：在 `CHINESE_SCRAPERS` 加 `kind: ajcass_vue` 条目+对应 JournalID；博渊星辰/勤云 CMS 期刊可复用 `scrape_cie`/`scrape_jqte`；管理世界模式见 `scrape_mwm`
 - 🌾 AgEcon 农经文库（过滤一周前旧条目）
 - 🧮 arXiv econ.GN + q-fin 预印本
 
