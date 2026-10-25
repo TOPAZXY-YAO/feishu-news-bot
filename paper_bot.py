@@ -48,7 +48,7 @@ JOURNAL_FEEDS = {f["name"] for f in FEEDS if f["section"] == "journal"}
 # （中国工业经济=博渊星辰CMS，取 id 最大连续段即当期；数量经济=勤云CMS，file_no=YYYYMMNN 取最大年月组）
 CHINESE_SCRAPERS = [
     {"name": "中国工业经济", "url": "https://ciejournal.ajcass.com", "kind": "cie", "cap": 8},
-    {"name": "数量经济技术经济研究", "url": "http://www.jqte.net", "kind": "jqte", "cap": 8},
+    {"name": "数量经济技术经济研究", "url": "https://www.jqte.net", "kind": "jqte", "cap": 8},
 ]
 
 SECTION_META = [
