@@ -51,6 +51,7 @@ CHINESE_SCRAPERS = [
     {"name": "经济研究", "kind": "ajcass_vue", "site": "https://erj.ajcass.com",
      "journal_id": "201803050001", "cap": 8,
      "detail_route": "/#/issue?id={id}&year={year}&issue={issue}"},
+    {"name": "管理世界", "kind": "mwm", "url": "http://www.mwm.net.cn", "cap": 8},
     {"name": "中国农村经济", "kind": "ajcass_vue", "site": "https://zgncjj.ajcass.com",
      "journal_id": "201606270007", "cap": 8,
      "detail_route": "/#/issueDetail?contentId={id}&year={year}&issue={issue}"},
@@ -233,7 +234,34 @@ def scrape_ajcass_vue(feed: dict) -> list:
             for it in items]
 
 
-SCRAPE_FUNCS = {"cie": scrape_cie, "jqte": scrape_jqte, "ajcass_vue": scrape_ajcass_vue}
+def scrape_mwm(feed: dict) -> list:
+    """管理世界（mwm.net.cn，仅 http 可达）：本期要目列表 + 文章页摘要。"""
+    base = feed["url"].rstrip("/")
+    html = news.http_get(base + "/web/bqym").decode("utf-8", errors="replace")
+    arts = re.findall(r'/web/xq\?leafId=(\d+)&amp;docId=(\d+)[^>]*>\s*([^<]{5,80})', html)
+    if not arts:
+        raise RuntimeError("本期要目页未找到文章链接（结构可能已变更）")
+    items = []
+    for lf, did, title in arts[:feed["cap"]]:
+        title = re.sub(r"\s+", " ", title).strip()
+        item = {"title": title, "link": f"{base}/web/xq?leafId={lf}&docId={did}",
+                "dt": None, "desc": "", "authors": ""}
+        try:
+            art = news.http_get(item["link"]).decode("utf-8", errors="replace")
+            m = re.search(r"作者：\s*([^<]{2,40})", art)
+            if m:
+                item["authors"] = m.group(1).strip()
+            m = re.search(r"摘要：</strong>(.{50,2500}?)</span>", art, re.S)
+            if m:
+                item["desc"] = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m.group(1))).strip()
+        except Exception:
+            pass
+        items.append(item)
+        time.sleep(0.2)
+    return items
+
+
+SCRAPE_FUNCS = {"cie": scrape_cie, "jqte": scrape_jqte, "ajcass_vue": scrape_ajcass_vue, "mwm": scrape_mwm}
 
 
 def fetch_all_papers() -> list:
