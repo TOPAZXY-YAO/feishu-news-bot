@@ -17,7 +17,13 @@ import urllib.error
 from datetime import datetime, timedelta, timezone
 
 import lark_oapi as lark
-from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, ReplyMessageRequest, ReplyMessageRequestBody
+from lark_oapi.api.im.v1 import (
+    P2ImMessageReceiveV1,
+    PatchMessageRequest,
+    PatchMessageRequestBody,
+    ReplyMessageRequest,
+    ReplyMessageRequestBody,
+)
 
 import feishu_news as news
 
@@ -34,7 +40,19 @@ HEADLINES = []
 HISTORY = {}  # chat_id -> [{"role","content"}]
 HISTORY_LIMIT = 16
 HISTORY_LOCK = threading.Lock()
+PROCESSED = []  # 最近处理过的 message_id，防长连接重连后事件重投导致重复回复
+PROCESSED_LOCK = threading.Lock()
 START_TS = time.time()
+
+
+def mark_processed(message_id: str) -> bool:
+    """首次见到该消息返回 True，重复事件返回 False。"""
+    with PROCESSED_LOCK:
+        if message_id in PROCESSED:
+            return False
+        PROCESSED.append(message_id)
+        del PROCESSED[:-200]
+        return True
 
 HELP_TEXT = (
     "📖 我是财经助手小财，可以这样用我：\n\n"
@@ -79,7 +97,8 @@ def get_bot_open_id() -> str:
     raise RuntimeError(f"获取机器人信息失败: {last}")
 
 
-def send_reply(api: lark.Client, message_id: str, msg_type: str, content) -> None:
+def send_reply(api: lark.Client, message_id: str, msg_type: str, content) -> str | None:
+    """回复消息，成功时返回新消息的 message_id（供后续更新用）。"""
     req = ReplyMessageRequest.builder() \
         .message_id(message_id) \
         .request_body(ReplyMessageRequestBody.builder()
@@ -90,6 +109,22 @@ def send_reply(api: lark.Client, message_id: str, msg_type: str, content) -> Non
     resp = api.im.v1.message.reply(req)
     if not resp.success():
         log(f"回复失败 code={resp.code} msg={resp.msg}")
+        return None
+    return getattr(resp.data, "message_id", None) if resp.data else None
+
+
+def patch_message(api: lark.Client, message_id: str, text: str) -> bool:
+    """把已发的文本消息原地更新为新内容（思考中占位 -> 最终答案）。"""
+    req = PatchMessageRequest.builder() \
+        .message_id(message_id) \
+        .request_body(PatchMessageRequestBody.builder()
+                      .content(json.dumps({"text": text}, ensure_ascii=False))
+                      .build()) \
+        .build()
+    resp = api.im.v1.message.patch(req)
+    if not resp.success():
+        log(f"更新消息失败 code={resp.code} msg={resp.msg}")
+    return resp.success()
 
 
 # ---------- 智谱 GLM ----------
@@ -99,7 +134,11 @@ def zhipu_chat(messages: list) -> str:
     for model in LLM_MODELS:
         for attempt in range(3):  # 免费档限流(429)时同模型退避重试
             try:
-                body = {"model": model, "messages": messages, "temperature": 0.6, "max_tokens": 2048}
+                body = {
+                    "model": model, "messages": messages,
+                    "temperature": 0.6, "max_tokens": 2048,
+                    "thinking": {"type": "disabled"},  # 关闭思考模式，直接给答案
+                }
                 req = urllib.request.Request(
                     "https://open.bigmodel.cn/api/paas/v4/chat/completions",
                     data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -122,7 +161,7 @@ def zhipu_chat(messages: list) -> str:
                 if e.code == 401:
                     raise RuntimeError("智谱 API Key 无效（401），请检查 ZHIPU_API_KEY")
                 if e.code == 429 and attempt < 2:
-                    time.sleep(5 * (attempt + 1))
+                    time.sleep(2 * (attempt + 1))
                     continue
                 break  # 其他错误换下一个模型
             except Exception as e:
@@ -183,6 +222,10 @@ def ai_reply(api: lark.Client, chat_id: str, message_id: str, text: str) -> None
         send_reply(api, message_id, "text", {
             "text": "AI 对话还没配置：需要在仓库 Secrets 里设置 ZHIPU_API_KEY。\n指令「早报」「帮助」目前可用。"})
         return
+
+    # 先秒回占位消息，AI 出结果后原地更新为答案，体感零等待
+    placeholder_id = send_reply(api, message_id, "text", {"text": "💭 思考中…"})
+
     with HISTORY_LOCK:
         history = HISTORY.setdefault(chat_id, [])
         history.append({"role": "user", "content": text})
@@ -192,17 +235,24 @@ def ai_reply(api: lark.Client, chat_id: str, message_id: str, text: str) -> None
     except Exception as e:
         with HISTORY_LOCK:
             history.pop()
-        send_reply(api, message_id, "text", {"text": f"AI 暂时没回答上来：{e}"})
+        err = f"AI 暂时没回答上来：{e}"
+        if placeholder_id and patch_message(api, placeholder_id, err):
+            return
+        send_reply(api, message_id, "text", {"text": err})
         return
     with HISTORY_LOCK:
         history.append({"role": "assistant", "content": answer})
-    send_reply(api, message_id, "text", {"text": answer})
+    if not (placeholder_id and patch_message(api, placeholder_id, answer)):
+        send_reply(api, message_id, "text", {"text": answer})
 
 
 def handle_message(data: P2ImMessageReceiveV1, api: lark.Client) -> None:
     try:
         msg = data.event.message
         if msg.message_type != "text":
+            return
+        if not mark_processed(msg.message_id):
+            log(f"跳过重复事件 {msg.message_id}")
             return
         try:
             content = json.loads(msg.content or "{}")
