@@ -48,8 +48,12 @@ JOURNAL_FEEDS = {f["name"] for f in FEEDS if f["section"] == "journal"}
 # （中国工业经济=博渊星辰CMS，取 id 最大连续段即当期；数量经济=勤云CMS，file_no=YYYYMMNN 取最大年月组；
 #   中国农村经济=ajcass 新平台 Vue CMS，官方 JSON API 可拿目录+逐篇摘要）
 CHINESE_SCRAPERS = [
+    {"name": "经济研究", "kind": "ajcass_vue", "site": "https://erj.ajcass.com",
+     "journal_id": "201803050001", "cap": 8,
+     "detail_route": "/#/issue?id={id}&year={year}&issue={issue}"},
     {"name": "中国农村经济", "kind": "ajcass_vue", "site": "https://zgncjj.ajcass.com",
-     "journal_id": "201606270007", "cap": 8},
+     "journal_id": "201606270007", "cap": 8,
+     "detail_route": "/#/issueDetail?contentId={id}&year={year}&issue={issue}"},
     {"name": "中国工业经济", "url": "https://ciejournal.ajcass.com", "kind": "cie", "cap": 8},
     {"name": "数量经济技术经济研究", "url": "https://www.jqte.net", "kind": "jqte", "cap": 8},
 ]
@@ -213,7 +217,7 @@ def scrape_ajcass_vue(feed: dict) -> list:
         try:
             body = {"channelId": 0, "contentId": it["id"], "dataShowType": 1,
                     "dataSourceType": 3, "issue": 0, "year": 0,
-                    "JournalID": feed["journal_id"]}
+                    "JournalID": int(feed["journal_id"])}  # 必须数字类型，字符串会 400
             req = urllib.request.Request(f"{api}/GetContentInfo",
                                          data=json.dumps(body).encode(), method="POST",
                                          headers=headers)
@@ -224,7 +228,7 @@ def scrape_ajcass_vue(feed: dict) -> list:
             it["desc"] = ""
         time.sleep(0.2)
     return [{"title": it["title"],
-             "link": f"{feed['site']}/#/issueDetail?contentId={it['id']}&year={year}&issue={issue}",
+             "link": feed["site"] + feed["detail_route"].format(id=it["id"], year=year, issue=issue),
              "dt": None, "desc": it["desc"], "authors": it["authors"]}
             for it in items]
 
