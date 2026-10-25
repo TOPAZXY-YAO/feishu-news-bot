@@ -97,29 +97,38 @@ def send_reply(api: lark.Client, message_id: str, msg_type: str, content) -> Non
 def zhipu_chat(messages: list) -> str:
     last_err = None
     for model in LLM_MODELS:
-        try:
-            body = {"model": model, "messages": messages, "temperature": 0.6, "max_tokens": 1024}
-            req = urllib.request.Request(
-                "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-                data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                headers={"Authorization": f"Bearer {ZHIPU_KEY}",
-                         "Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=90) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            return data["choices"][0]["message"]["content"].strip()
-        except urllib.error.HTTPError as e:
-            detail = ""
+        for attempt in range(3):  # 免费档限流(429)时同模型退避重试
             try:
-                detail = e.read().decode("utf-8", errors="replace")[:200]
-            except Exception:
-                pass
-            last_err = f"HTTP {e.code}: {detail}"
-            log(f"模型 {model} 失败: {last_err}")
-            if e.code == 401:
-                raise RuntimeError("智谱 API Key 无效（401），请检查 ZHIPU_API_KEY")
-        except Exception as e:
-            last_err = e
-            log(f"模型 {model} 异常: {e}")
+                body = {"model": model, "messages": messages, "temperature": 0.6, "max_tokens": 2048}
+                req = urllib.request.Request(
+                    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+                    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                    headers={"Authorization": f"Bearer {ZHIPU_KEY}",
+                             "Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=90) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                answer = (data["choices"][0]["message"].get("content") or "").strip()
+                if not answer:
+                    answer = "（这次思考太久了没写出答案，再问一次试试）"
+                return answer
+            except urllib.error.HTTPError as e:
+                detail = ""
+                try:
+                    detail = e.read().decode("utf-8", errors="replace")[:200]
+                except Exception:
+                    pass
+                last_err = f"HTTP {e.code}: {detail}"
+                log(f"模型 {model} 失败(第{attempt + 1}次): {last_err}")
+                if e.code == 401:
+                    raise RuntimeError("智谱 API Key 无效（401），请检查 ZHIPU_API_KEY")
+                if e.code == 429 and attempt < 2:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                break  # 其他错误换下一个模型
+            except Exception as e:
+                last_err = e
+                log(f"模型 {model} 异常: {e}")
+                break
     raise RuntimeError(f"所有模型均失败: {last_err}")
 
 
