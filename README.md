@@ -15,6 +15,17 @@
 
 密钥：`FEISHU_APP_ID`、`FEISHU_APP_SECRET`（自建应用凭证）、`ZHIPU_API_KEY`（bigmodel.cn）。
 
+## 经管论文日报机器人
+
+`paper_bot.py` + `.github/workflows/paper-daily.yml`：每天 08:30 推送经管类新论文到独立的群（单独的自定义机器人 Webhook）。
+
+- 📚 NBER 工作论文（带作者）
+- 📖 期刊最新发表：发展经济学 JDE / 中国经济评论 / 城市经济学 JUE / World Development（Elsevier RSS，刊列表在 `paper_bot.py` 的 FEEDS 里可增删，任意刊改 ISSN 即可）
+- 🌾 AgEcon 农经文库（过滤一周前旧条目）
+- 🧮 arXiv econ.GN + q-fin 预印本
+
+密钥：`PAPER_WEBHOOK_URL`、`PAPER_SECRET`；去重状态 `paper_state.json` 每日回写。中文期刊（经济研究/管理世界等）官网无稳定接口，暂未纳入，找到稳定通道后在 FEEDS/抓取器中扩展。
+
 也可切换回本地模式：Windows 计划任务 `FeishuNewsBot`（见下文「注册每日定时任务」），密钥放在本地 `config.json`。
 
 ## 推送内容
