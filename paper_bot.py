@@ -264,21 +264,26 @@ def scrape_mwm(feed: dict) -> list:
 SCRAPE_FUNCS = {"cie": scrape_cie, "jqte": scrape_jqte, "ajcass_vue": scrape_ajcass_vue, "mwm": scrape_mwm}
 
 
-def fetch_all_papers() -> list:
+def fetch_all_papers(cn_local: bool = False) -> list:
     all_items = []
-    for feed in FEEDS:
-        try:
-            items = news.parse_feed(news.http_get(feed["url"]))
-            for it in items:
-                it["section"] = feed["section"]
-                it["cap"] = feed["cap"]
-                it["src"] = feed["name"]
-                it["zh"] = False
-            all_items.extend(items)
-            news.log(f"源 {feed['name']}: 获取 {len(items)} 条")
-        except Exception as e:
-            news.log(f"源 {feed['name']} 失败（跳过）: {e}")
-    for feed in CHINESE_SCRAPERS:
+    scrapers = CHINESE_SCRAPERS
+    if cn_local:
+        # 本地通道：只抓海外机房被墙、需要中国网络的两本刊
+        scrapers = [s for s in CHINESE_SCRAPERS if s["kind"] in ("mwm", "jqte")]
+    else:
+        for feed in FEEDS:
+            try:
+                items = news.parse_feed(news.http_get(feed["url"]))
+                for it in items:
+                    it["section"] = feed["section"]
+                    it["cap"] = feed["cap"]
+                    it["src"] = feed["name"]
+                    it["zh"] = False
+                all_items.extend(items)
+                news.log(f"源 {feed['name']}: 获取 {len(items)} 条")
+            except Exception as e:
+                news.log(f"源 {feed['name']} 失败（跳过）: {e}")
+    for feed in scrapers:
         try:
             items = SCRAPE_FUNCS[feed["kind"]](feed)
             for it in items:
@@ -406,15 +411,27 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--test", action="store_true")
+    ap.add_argument("--cn-local", action="store_true",
+                    help="本地通道：仅抓海外被墙的中文刊（管理世界/数量经济），独立状态文件")
     args = ap.parse_args()
 
-    import os
+    global STATE_FILE, ZHIPU_KEY
+    if args.cn_local:
+        STATE_FILE = BASE / "paper_state_local.json"
+        env_file = BASE / "local_env.json"  # 本地凭证（gitignore，不入库）
+        if env_file.exists():
+            with open(env_file, encoding="utf-8") as f:
+                for k, v in json.load(f).items():
+                    os.environ.setdefault(k, str(v))
+        ZHIPU_KEY = os.environ.get("ZHIPU_API_KEY", "")
+        news.log("本地通道模式：管理世界 + 数量经济技术经济研究")
+
     webhook = os.environ.get("PAPER_WEBHOOK_URL", "")
     secret = os.environ.get("PAPER_SECRET", "")
     now = datetime.now(timezone(timedelta(hours=8)))
 
     if args.dry_run:
-        items = fetch_all_papers()
+        items = fetch_all_papers(cn_local=args.cn_local)
         card, total = build_paper_card(items, now)
         print(json.dumps({"msg_type": "interactive", "card": card}, ensure_ascii=False, indent=2))
         return
@@ -428,7 +445,7 @@ def main():
         news.log("测试卡片已发送。")
         return
 
-    items = fetch_all_papers()
+    items = fetch_all_papers(cn_local=args.cn_local)
     if not items:
         news.log("所有数据源均失败，本次不推送。")
         sys.exit(2)
