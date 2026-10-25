@@ -14,6 +14,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import lark_oapi as lark
@@ -42,6 +43,9 @@ HISTORY_LIMIT = 16
 HISTORY_LOCK = threading.Lock()
 PROCESSED = []  # 最近处理过的 message_id，防长连接重连后事件重投导致重复回复
 PROCESSED_LOCK = threading.Lock()
+# 事件处理线程池：入口函数必须毫秒级返回（SDK 处理完才发 ACK，同步 LLM 调用会
+# 让 ACK 拖几十秒 → 飞书判定未送达而重投事件 → 重复回复，还会阻塞事件循环断线）
+WORKER = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bot")
 START_TS = time.time()
 
 
@@ -247,6 +251,7 @@ def ai_reply(api: lark.Client, chat_id: str, message_id: str, text: str) -> None
 
 
 def handle_message(data: P2ImMessageReceiveV1, api: lark.Client) -> None:
+    """SDK 事件入口：只做类型校验+去重，毫秒级返回让 SDK 立刻 ACK；实际处理在后台线程。"""
     try:
         msg = data.event.message
         if msg.message_type != "text":
@@ -254,6 +259,14 @@ def handle_message(data: P2ImMessageReceiveV1, api: lark.Client) -> None:
         if not mark_processed(msg.message_id):
             log(f"跳过重复事件 {msg.message_id}")
             return
+        WORKER.submit(process_message, data, api)
+    except Exception as e:
+        log(f"事件入队异常: {type(e).__name__}: {e}")
+
+
+def process_message(data: P2ImMessageReceiveV1, api: lark.Client) -> None:
+    try:
+        msg = data.event.message
         try:
             content = json.loads(msg.content or "{}")
         except Exception:
