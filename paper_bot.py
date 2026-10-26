@@ -45,18 +45,18 @@ FEEDS = [
 JOURNAL_FEEDS = {f["name"] for f in FEEDS if f["section"] == "journal"}
 
 # 中文顶刊：官网无 RSS，直接解析首页服务端渲染的当期目录或调用官方 API
-# （中国工业经济=博渊星辰CMS，取 id 最大连续段即当期；数量经济=勤云CMS，file_no=YYYYMMNN 取最大年月组；
-#   中国农村经济=ajcass 新平台 Vue CMS，官方 JSON API 可拿目录+逐篇摘要）
+# （中国工业经济=博渊星辰CMS，取 id 最大连续段即当期；中国农村经济/经济研究=ajcass 新平台 Vue CMS，
+#   官方 JSON API 可拿目录+逐篇摘要）
+# 注：管理世界(mwm.net.cn)与数量经济技术经济研究(jqte.net)官网屏蔽海外机房 IP，
+#     已按用户决定移除（本地通道方案也已弃用），不再纳入
 CHINESE_SCRAPERS = [
     {"name": "经济研究", "kind": "ajcass_vue", "site": "https://erj.ajcass.com",
      "journal_id": "201803050001", "cap": 8,
      "detail_route": "/#/issue?id={id}&year={year}&issue={issue}"},
-    {"name": "管理世界", "kind": "mwm", "url": "http://www.mwm.net.cn", "cap": 8},
     {"name": "中国农村经济", "kind": "ajcass_vue", "site": "https://zgncjj.ajcass.com",
      "journal_id": "201606270007", "cap": 8,
      "detail_route": "/#/issueDetail?contentId={id}&year={year}&issue={issue}"},
     {"name": "中国工业经济", "url": "https://ciejournal.ajcass.com", "kind": "cie", "cap": 8},
-    {"name": "数量经济技术经济研究", "url": "https://www.jqte.net", "kind": "jqte", "cap": 8},
 ]
 
 SECTION_META = [
@@ -171,24 +171,6 @@ def scrape_cie(feed: dict) -> list:
     return items[:feed["cap"]]
 
 
-def scrape_jqte(feed: dict) -> list:
-    """数量经济技术经济研究（勤云CMS）：file_no=YYYYMMNN，取最大年月组即当期目录。"""
-    html = news.http_get(feed["url"]).decode("utf-8", errors="replace")
-    pairs = re.findall(r'view_abstract\.aspx\?file_no=(\d+)[^"\']*["\'][^>]*>\s*([^<]{5,80})', html)
-    if not pairs:
-        raise RuntimeError("首页未找到文章链接（结构可能已变更）")
-    latest = max(f[:6] for f, _ in pairs)  # YYYYMM
-    items, seen = [], set()
-    for fno, title in pairs:
-        if fno[:6] == latest and fno not in seen:
-            seen.add(fno)
-            t = re.sub(r"\s+", " ", title).strip()
-            if len(t) >= 8:
-                items.append({"title": t,
-                              "link": f"{feed['url']}/reader/view_abstract.aspx?file_no={fno}&flag=1",
-                              "dt": None, "desc": ""})
-    return items[:feed["cap"]]
-
 
 def scrape_ajcass_vue(feed: dict) -> list:
     """ajcass 新平台（如中国农村经济）：官方 JSON API，当期目录 + 逐篇摘要。"""
@@ -234,56 +216,25 @@ def scrape_ajcass_vue(feed: dict) -> list:
             for it in items]
 
 
-def scrape_mwm(feed: dict) -> list:
-    """管理世界（mwm.net.cn，仅 http 可达）：本期要目列表 + 文章页摘要。"""
-    base = feed["url"].rstrip("/")
-    html = news.http_get(base + "/web/bqym").decode("utf-8", errors="replace")
-    arts = re.findall(r'/web/xq\?leafId=(\d+)&amp;docId=(\d+)[^>]*>\s*([^<]{5,80})', html)
-    if not arts:
-        raise RuntimeError("本期要目页未找到文章链接（结构可能已变更）")
-    items = []
-    for lf, did, title in arts[:feed["cap"]]:
-        title = re.sub(r"\s+", " ", title).strip()
-        item = {"title": title, "link": f"{base}/web/xq?leafId={lf}&docId={did}",
-                "dt": None, "desc": "", "authors": ""}
-        try:
-            art = news.http_get(item["link"]).decode("utf-8", errors="replace")
-            m = re.search(r"作者：\s*([^<]{2,40})", art)
-            if m:
-                item["authors"] = m.group(1).strip()
-            m = re.search(r"摘要：</strong>(.{50,2500}?)</span>", art, re.S)
-            if m:
-                item["desc"] = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", m.group(1))).strip()
-        except Exception:
-            pass
-        items.append(item)
-        time.sleep(0.2)
-    return items
+
+SCRAPE_FUNCS = {"cie": scrape_cie, "ajcass_vue": scrape_ajcass_vue}
 
 
-SCRAPE_FUNCS = {"cie": scrape_cie, "jqte": scrape_jqte, "ajcass_vue": scrape_ajcass_vue, "mwm": scrape_mwm}
-
-
-def fetch_all_papers(cn_local: bool = False) -> list:
+def fetch_all_papers() -> list:
     all_items = []
-    scrapers = CHINESE_SCRAPERS
-    if cn_local:
-        # 本地通道：只抓海外机房被墙、需要中国网络的两本刊
-        scrapers = [s for s in CHINESE_SCRAPERS if s["kind"] in ("mwm", "jqte")]
-    else:
-        for feed in FEEDS:
-            try:
-                items = news.parse_feed(news.http_get(feed["url"]))
-                for it in items:
-                    it["section"] = feed["section"]
-                    it["cap"] = feed["cap"]
-                    it["src"] = feed["name"]
-                    it["zh"] = False
-                all_items.extend(items)
-                news.log(f"源 {feed['name']}: 获取 {len(items)} 条")
-            except Exception as e:
-                news.log(f"源 {feed['name']} 失败（跳过）: {e}")
-    for feed in scrapers:
+    for feed in FEEDS:
+        try:
+            items = news.parse_feed(news.http_get(feed["url"]))
+            for it in items:
+                it["section"] = feed["section"]
+                it["cap"] = feed["cap"]
+                it["src"] = feed["name"]
+                it["zh"] = False
+            all_items.extend(items)
+            news.log(f"源 {feed['name']}: 获取 {len(items)} 条")
+        except Exception as e:
+            news.log(f"源 {feed['name']} 失败（跳过）: {e}")
+    for feed in CHINESE_SCRAPERS:
         try:
             items = SCRAPE_FUNCS[feed["kind"]](feed)
             for it in items:
@@ -411,27 +362,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--test", action="store_true")
-    ap.add_argument("--cn-local", action="store_true",
-                    help="本地通道：仅抓海外被墙的中文刊（管理世界/数量经济），独立状态文件")
     args = ap.parse_args()
-
-    global STATE_FILE, ZHIPU_KEY
-    if args.cn_local:
-        STATE_FILE = BASE / "paper_state_local.json"
-        env_file = BASE / "local_env.json"  # 本地凭证（gitignore，不入库）
-        if env_file.exists():
-            with open(env_file, encoding="utf-8") as f:
-                for k, v in json.load(f).items():
-                    os.environ.setdefault(k, str(v))
-        ZHIPU_KEY = os.environ.get("ZHIPU_API_KEY", "")
-        news.log("本地通道模式：管理世界 + 数量经济技术经济研究")
 
     webhook = os.environ.get("PAPER_WEBHOOK_URL", "")
     secret = os.environ.get("PAPER_SECRET", "")
     now = datetime.now(timezone(timedelta(hours=8)))
 
     if args.dry_run:
-        items = fetch_all_papers(cn_local=args.cn_local)
+        items = fetch_all_papers()
         card, total = build_paper_card(items, now)
         print(json.dumps({"msg_type": "interactive", "card": card}, ensure_ascii=False, indent=2))
         return
@@ -445,7 +383,7 @@ def main():
         news.log("测试卡片已发送。")
         return
 
-    items = fetch_all_papers(cn_local=args.cn_local)
+    items = fetch_all_papers()
     if not items:
         news.log("所有数据源均失败，本次不推送。")
         sys.exit(2)
