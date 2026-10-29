@@ -324,6 +324,22 @@ def send(webhook_url: str, payload: dict, secret: str = "", retries: int = 3) ->
     raise last_err
 
 
+def send_all(cfg: dict, payload: dict) -> int:
+    """向全部 webhook 推送（webhook_url 逗号分隔多个群），返回成功数。
+    secret 同样按逗号与 webhook 一一对应，缺位视为无签名。"""
+    webhooks = [w.strip() for w in (cfg.get("webhook_url") or "").split(",") if w.strip()]
+    secrets = [s.strip() for s in (cfg.get("secret") or "").split(",")]
+    ok = 0
+    for i, wh in enumerate(webhooks):
+        try:
+            send(wh, payload, secrets[i] if i < len(secrets) else "")
+            ok += 1
+            log(f"推送成功 -> {wh[:66]}…")
+        except Exception as e:
+            log(f"推送失败 -> {wh[:66]}…: {e}")
+    return ok
+
+
 # ---------- 主流程 ----------
 
 def main():
@@ -349,8 +365,10 @@ def main():
         sys.exit(1)
 
     if args.test:
-        send(cfg["webhook_url"], {"msg_type": "interactive", "card": build_test_card()}, cfg.get("secret", ""))
-        log("测试卡片已发送。")
+        ok = send_all(cfg, {"msg_type": "interactive", "card": build_test_card()})
+        if ok == 0:
+            sys.exit(2)
+        log(f"测试卡片已发送至 {ok} 个群。")
         return
 
     items = fetch_all(cfg["feeds"])
@@ -366,11 +384,14 @@ def main():
         log("过滤后无新闻可推，跳过发送（不更新去重状态）。")
         return
 
-    send(cfg["webhook_url"], {"msg_type": "interactive", "card": card}, cfg.get("secret", ""))
+    ok = send_all(cfg, {"msg_type": "interactive", "card": card})
+    if ok == 0:
+        log("所有群均推送失败，不更新去重状态（下次重推）。")
+        sys.exit(2)
     state["seen"].extend(it["link"] for it in items)
     state["last_push"] = now.isoformat()
     save_state(state)
-    log(f"推送成功，共 {n} 条。")
+    log(f"推送完成，共 {n} 条，送达 {ok}/{len(cfg['webhook_url'].split(','))} 个群。")
 
 
 if __name__ == "__main__":
