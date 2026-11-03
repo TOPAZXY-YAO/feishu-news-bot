@@ -30,11 +30,13 @@ import feishu_news as news
 
 APP_ID = os.environ.get("FEISHU_APP_ID", "")
 APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
+DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 ZHIPU_KEY = os.environ.get("ZHIPU_API_KEY", "")
+GLM_MODELS = ["glm-4-flash-250414", "glm-4.5-flash", "glm-4.7-flash"]  # 免费兜底链
 
 # 实测（2026-10-26 凌晨）：glm-4.7-flash 免费档持续 429 限流，glm-4-flash-250414
 # 稳定且快（471字/6.4s、零限流），故将其提为主力，新模型作备份
-LLM_MODELS = ["glm-4-flash-250414", "glm-4.7-flash", "glm-4.5-flash"]
+LLM_MODELS = GLM_MODELS  # 兼容旧引用
 LIFETIME_MINUTES = int(os.environ.get("LIFETIME_MINUTES", "310"))  # 主动续命点，低于 job 硬超时
 STABLE_MINUTES = 10  # 运行超过该时长才算"稳定过"，崩溃时才续命
 
@@ -135,23 +137,36 @@ def patch_message(api: lark.Client, message_id: str, text: str) -> bool:
 
 # ---------- 智谱 GLM ----------
 
-def zhipu_chat(messages: list, on_update=None) -> str:
-    """流式调用智谱；on_update(已生成全文) 约每 1.5 秒回调一次，用于消息增量更新。"""
+def _llm_request(provider: str, model: str, key: str, messages: list, stream: bool):
+    """构造各厂商的 chat completions 请求（均为 OpenAI 兼容格式）。"""
+    if provider == "deepseek":
+        url = "https://api.deepseek.com/chat/completions"
+        body = {"model": model, "messages": messages, "temperature": 0.6,
+                "max_tokens": 2048, "stream": stream}
+    else:  # zhipu
+        url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        body = {"model": model, "messages": messages, "temperature": 0.6,
+                "max_tokens": 2048, "thinking": {"type": "disabled"}, "stream": stream}
+    return urllib.request.Request(
+        url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+
+
+def llm_chat(messages: list, on_update=None) -> str:
+    """流式调用大模型：DeepSeek 主力，智谱免费模型兜底。
+    on_update(已生成全文) 约每 1.5 秒回调一次，用于消息增量更新。"""
+    attempts = []
+    if DEEPSEEK_KEY:
+        attempts.append(("deepseek", "deepseek-chat", DEEPSEEK_KEY))
+    if ZHIPU_KEY:
+        attempts += [("zhipu", m, ZHIPU_KEY) for m in GLM_MODELS]
+    if not attempts:
+        raise RuntimeError("未配置任何 LLM API Key")
     last_err = None
-    for model in LLM_MODELS:
+    for provider, model, key in attempts:
         for attempt in range(2):  # 429 只快速重试一次，尽快换下一个模型
             try:
-                body = {
-                    "model": model, "messages": messages,
-                    "temperature": 0.6, "max_tokens": 1024,
-                    "thinking": {"type": "disabled"},
-                    "stream": True,
-                }
-                req = urllib.request.Request(
-                    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-                    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                    headers={"Authorization": f"Bearer {ZHIPU_KEY}",
-                             "Content-Type": "application/json"})
+                req = _llm_request(provider, model, key, messages, stream=True)
                 chunks, last_cb = [], 0.0
                 with urllib.request.urlopen(req, timeout=90) as resp:
                     for raw in resp:
@@ -186,16 +201,18 @@ def zhipu_chat(messages: list, on_update=None) -> str:
                 except Exception:
                     pass
                 last_err = f"HTTP {e.code}: {detail}"
-                log(f"模型 {model} 失败(第{attempt + 1}次): {last_err}")
-                if e.code == 401:
-                    raise RuntimeError("智谱 API Key 无效（401），请检查 ZHIPU_API_KEY")
+                log(f"模型 {provider}/{model} 失败(第{attempt + 1}次): {last_err}")
+                if e.code in (401, 402):  # key 无效或余额不足，直接换下一家
+                    if provider == "deepseek":
+                        log("DeepSeek key 无效或余额不足（401/402），后续回退智谱免费模型")
+                    break
                 if e.code == 429 and attempt < 1:
                     time.sleep(2)
                     continue
                 break  # 其他错误/重试耗尽，换下一个模型
             except Exception as e:
                 last_err = e
-                log(f"模型 {model} 异常: {e}")
+                log(f"模型 {provider}/{model} 异常: {e}")
                 break
     raise RuntimeError(f"所有模型均失败: {last_err}")
 
@@ -248,9 +265,9 @@ def send_digest(api: lark.Client, message_id: str) -> None:
 
 
 def ai_reply(api: lark.Client, chat_id: str, message_id: str, text: str) -> None:
-    if not ZHIPU_KEY:
+    if not (DEEPSEEK_KEY or ZHIPU_KEY):
         send_reply(api, message_id, "text", {
-            "text": "AI 对话还没配置：需要在仓库 Secrets 里设置 ZHIPU_API_KEY。\n指令「早报」「帮助」目前可用。"})
+            "text": "AI 对话还没配置：需要在仓库 Secrets 里设置 DEEPSEEK_API_KEY。\n指令「早报」「帮助」目前可用。"})
         return
 
     # 先秒回占位消息，AI 流式生成过程中逐段更新它，出结果后原地替换为完整答案
@@ -268,7 +285,7 @@ def ai_reply(api: lark.Client, chat_id: str, message_id: str, text: str) -> None
         history.append({"role": "user", "content": text})
         msgs = [{"role": "system", "content": system_prompt()}] + history[-HISTORY_LIMIT:]
     try:
-        answer = zhipu_chat(msgs, on_update=on_update)
+        answer = llm_chat(msgs, on_update=on_update)
     except Exception as e:
         with HISTORY_LOCK:
             history.pop()
