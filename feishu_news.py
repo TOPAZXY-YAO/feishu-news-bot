@@ -465,22 +465,27 @@ def ai_newspaper_full(materials: list, quotes: list) -> dict:
         "你是资深财经报纸主编，为一份四页「报纸图片版」组稿。基于素材正文撰写，读者看图即可完全了解新闻，"
         "绝不点链接。所有摘要信息完整（发生了什么+关键数字+为何重要+后续关注什么），数字只来自素材，不编造。\n"
         "1. lead：选今日最重要新闻，写 150-220 字深度报道（背景+事实+影响面）。\n"
-        "2. top：再选 3 条重要新闻，各写 100-140 字深度摘要。\n"
-        "3. market_briefs：全球市场相关 3 条，各 60-90 字。\n"
-        "4. cn_briefs：A股与国内宏观相关 3 条，各 60-90 字。\n"
-        "5. industry_briefs：行业与公司相关 3 条，各 60-90 字。\n"
-        "6. comment：今日解读 4 条要点（每条≤40字）+ 最后一条风险提示（≤40字），每条以 - 开头。\n"
-        "7. review：400-600 字深度市场综述，用两段分隔：第一段串联当日主线与逻辑，"
-        "第二段给出对后续 1-2 周的情景推演与观察点。观点鲜明、有逻辑链，不确定处注明。\n"
+        "2. top：再选 4 条重要新闻，各写 100-140 字深度摘要。\n"
+        "3. market_briefs：全球市场相关 4 条，各 60-90 字。\n"
+        "4. cn_briefs：A股与国内宏观相关 4 条，各 60-90 字。\n"
+        "5. industry_briefs：行业与公司相关 4 条，各 60-90 字。\n"
+        "6. comment：今日解读 5 条要点（每条≤40字）+ 最后一条风险提示（≤40字），每条以 - 开头。\n"
+        "7. review：600-900 字深度市场综述，分三段（用两个空行分隔）：第一段串联当日主线与"
+        "资金/情绪逻辑；第二段给出对后续 1-2 周的情景推演（各情景的触发条件与对应板块影响）；"
+        "第三段列出 3-4 个具体观察点（数据、事件、价位）。观点鲜明、有逻辑链，不确定处注明。\n"
+        "8. calendar：基于素材与常规日程，列出未来 5 个值得关注的财经事件/数据（非农、CPI、"
+        "财报、央行动态、行业事件等），when 用简短时间表述（如 周四晚 / 本周内 / 11月中旬），"
+        "event ≤30字。素材未提及的不要编造具体日期，用模糊表述。\n"
         "英文素材全部用中文。只输出 JSON（无其他文字/代码块标记）：\n"
-        '{"lead": {"no": 编号, "summary": "..."}, "top": [{"no": 编号, "summary": "..."}, ...3条], '
-        '"market_briefs": [{"no": 编号, "brief": "..."}, ...3条], '
-        '"cn_briefs": [{"no": 编号, "brief": "..."}, ...3条], '
-        '"industry_briefs": [{"no": 编号, "brief": "..."}, ...3条], '
-        '"comment": ["- ...", ...], "review": "…"}\n\n'
+        '{"lead": {"no": 编号, "summary": "..."}, "top": [{"no": 编号, "summary": "..."}, ...4条], '
+        '"market_briefs": [{"no": 编号, "brief": "..."}, ...4条], '
+        '"cn_briefs": [{"no": 编号, "brief": "..."}, ...4条], '
+        '"industry_briefs": [{"no": 编号, "brief": "..."}, ...4条], '
+        '"comment": ["- ...", ...], "calendar": [{"when": "...", "event": "..."}, ...5条], '
+        '"review": "…"}\n\n'
         f"日期：{now.strftime('%Y-%m-%d %A')}\n指数表现：{idx_line}\n\n素材：\n{mat}"
     )
-    text = llm_complete([{"role": "user", "content": prompt}], max_tokens=3000, temperature=0.35)
+    text = llm_complete([{"role": "user", "content": prompt}], max_tokens=4400, temperature=0.35)
     m = re.search(r"\{.*\}", text, re.S)
     if not m:
         raise RuntimeError(f"AI 未返回 JSON: {text[:120]}")
@@ -510,6 +515,8 @@ def ai_newspaper_full(materials: list, quotes: list) -> dict:
             "cn_briefs": group("cn_briefs", "brief"),
             "industry_briefs": group("industry_briefs", "brief"),
             "comment": [str(x) for x in data.get("comment", [])],
+            "calendar": [{"when": str(e.get("when", "")), "event": str(e.get("event", ""))}
+                         for e in data.get("calendar", [])[:5] if e.get("event")],
             "review": review}
 
 
