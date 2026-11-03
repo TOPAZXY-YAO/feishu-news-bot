@@ -9,6 +9,10 @@ on:
         description: "只发测试卡片（不推新闻）"
         type: boolean
         default: false
+      preview:
+        description: "预览模式：跳过去重推当前内容（含图表+AI解读），不更新去重状态"
+        type: boolean
+        default: false
 
 concurrency:
   group: daily-finance-news
@@ -27,13 +31,23 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: 安装图表依赖与中文字体
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
+          pip install -q matplotlib
+
       - name: 推送财经早报
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
         run: |
           if [ "${{ inputs.test_only }}" = "true" ]; then
             python feishu_news.py --test
+          elif [ "${{ inputs.preview }}" = "true" ]; then
+            python feishu_news.py --preview
           else
             python feishu_news.py
           fi
@@ -47,5 +61,6 @@ jobs:
             echo "去重状态无变化，跳过提交"
           else
             git commit -m "chore: update dedup state"
+            git pull --rebase origin main || true
             git push
           fi
