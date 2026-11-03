@@ -240,7 +240,8 @@ def send_digest(api: lark.Client, message_id: str) -> None:
         if not items:
             send_reply(api, message_id, "text", {"text": "新闻源暂时抓取失败，稍后再试~"})
             return
-        card = news.build_card(items, cfg, now)
+        fresh = news.filter_fresh(items, cfg, now)
+        card = news.build_card(fresh, cfg, now)
         send_reply(api, message_id, "interactive", card)
     except Exception as e:
         send_reply(api, message_id, "text", {"text": f"生成早报失败: {type(e).__name__}: {e}"})
