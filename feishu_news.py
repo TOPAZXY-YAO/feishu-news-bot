@@ -65,6 +65,9 @@ CATEGORY_KEYS = {
 # 明显的营销/广告类标题关键词，直接过滤
 PROMO_BLOCKLIST = ["见闻历", "直播预约", "活动报名", "会员专享", "限时优惠"]
 
+# 全球主要指数（腾讯行情代码）：早报图表数据源
+MARKET_INDICES = ["sh000001", "sz399001", "sz399006", "hkHSI", "usDJI", "usIXIC", "usINX"]
+
 
 # ---------- 基础工具 ----------
 
@@ -190,8 +193,10 @@ def save_state(state: dict) -> None:
 WEEKDAYS = "一二三四五六日"
 
 
-def build_card(items: list, cfg: dict, now: datetime) -> dict:
-    state = load_state()
+def filter_fresh(items: list, cfg: dict, now: datetime, state: dict = None) -> list:
+    """按去重状态与时间窗过滤。state=None 时不过滤（--preview 用）。"""
+    if state is None:
+        state = {"seen": [], "last_push": None}
     seen = set(state["seen"])
     since = now - timedelta(hours=cfg["hours_lookback"])
     if state.get("last_push"):
@@ -213,7 +218,183 @@ def build_card(items: list, cfg: dict, now: datetime) -> dict:
             continue
         kept_links.add(link)
         fresh.append(it)
+    return fresh
 
+
+# ---------- 行情图表与 AI 分析 ----------
+
+def fetch_quotes() -> list:
+    """腾讯行情接口取全球主要指数，返回 [{name, price, prev, pct}]；失败抛异常。"""
+    url = "https://qt.gtimg.cn/q=" + ",".join(MARKET_INDICES)
+    text = http_get(url).decode("gbk", errors="replace")
+    quotes = []
+    for line in text.strip().split(";"):
+        line = line.strip()
+        if "=" not in line:
+            continue
+        f = line.split("=", 1)[1].strip('"').split("~")
+        if len(f) > 32 and f[1] and f[3]:
+            try:
+                quotes.append({"name": f[1], "price": float(f[3]),
+                               "prev": float(f[4]), "pct": float(f[32])})
+            except ValueError:
+                continue
+    if not quotes:
+        raise RuntimeError("行情接口未返回有效数据")
+    return quotes
+
+
+def make_chart(quotes: list, now: datetime) -> str:
+    """涨跌幅横向条形图（中式配色：涨红跌绿），返回 PNG 路径。"""
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import font_manager, pyplot as plt
+
+    for cand in ("Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "WenQuanYi Zen Hei"):
+        if any(f.name == cand for f in font_manager.fontManager.ttflist):
+            plt.rcParams["font.family"] = cand
+            break
+    plt.rcParams["axes.unicode_minus"] = False
+
+    qs = sorted(quotes, key=lambda q: q["pct"])
+    names = [q["name"] for q in qs]
+    pcts = [q["pct"] for q in qs]
+    colors = ["#d93a3a" if p >= 0 else "#1a9e5c" for p in pcts]
+
+    fig, ax = plt.subplots(figsize=(9, 4.8), dpi=150)
+    bars = ax.barh(names, pcts, color=colors, height=0.62)
+    for bar, pct in zip(bars, pcts):
+        off = 0.03 if pct >= 0 else -0.03
+        ax.text(pct + off, bar.get_y() + bar.get_height() / 2,
+                f"{pct:+.2f}%", va="center",
+                ha="left" if pct >= 0 else "right", fontsize=10,
+                color="#333333")
+    ax.axvline(0, color="#888888", lw=0.8)
+    ax.set_title(f"全球主要指数涨跌幅 %（{now.strftime('%m-%d %H:%M')} 北京时间）",
+                 fontsize=13, pad=10)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.margins(y=0.02)
+    xmin, xmax = ax.get_xlim()
+    ax.set_xlim(xmin - 0.6, xmax + 0.6)
+    fig.tight_layout()
+    path = str(BASE / "market_chart.png")
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def upload_image(png_path: str) -> str:
+    """用小财应用凭证上传图片，返回 image_key（需应用有 im:resource 权限）。"""
+    app_id = os.environ.get("FEISHU_APP_ID", "")
+    app_secret = os.environ.get("FEISHU_APP_SECRET", "")
+    if not app_id or not app_secret:
+        raise RuntimeError("缺少 FEISHU_APP_ID/FEISHU_APP_SECRET，无法上传图片")
+    req = urllib.request.Request(
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        data=json.dumps({"app_id": app_id, "app_secret": app_secret}).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        token = json.loads(resp.read())["tenant_access_token"]
+
+    import uuid
+    boundary = uuid.uuid4().hex
+    with open(png_path, "rb") as f:
+        img_bytes = f.read()
+    body = (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="image_type"\r\n\r\nmessage\r\n'
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="image"; filename="chart.png"\r\n'
+            f"Content-Type: image/png\r\n\r\n").encode() + img_bytes + \
+        f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        "https://open.feishu.cn/open-apis/im/v1/images", data=body, method="POST",
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = json.loads(resp.read())
+    if result.get("code") != 0:
+        raise RuntimeError(f"图片上传失败: {result.get('msg')}")
+    return result["data"]["image_key"]
+
+
+def zhipu_analysis(headlines: list, quotes: list) -> str:
+    """智谱免费模型生成今日解读（3-4 条要点 + 风险提示），失败返回空串。"""
+    key = os.environ.get("ZHIPU_API_KEY", "")
+    if not key:
+        return ""
+    now = datetime.now(timezone(timedelta(hours=8)))
+    idx_line = " ".join(f"{q['name']}{q['pct']:+.2f}%" for q in quotes)
+    prompt = (
+        "你是财经早报编辑。基于下面的隔夜与近期要闻标题、以及全球主要指数表现，"
+        "写一份简短的「今日解读」：3-4 条要点（每条不超过40字，指出市场主线、"
+        "逻辑或值得关注的信号）+ 最后单独一条风险提示（不超过40字）。\n"
+        "要求：中文；直接输出条目，每条一行以 - 开头；不要客套话和总结；"
+        "不编造标题之外的具体数字。\n\n"
+        f"日期：{now.strftime('%Y-%m-%d %A')}\n"
+        f"指数表现：{idx_line}\n"
+        "要闻标题：\n" + "\n".join(f"- {t}" for t in headlines[:12])
+    )
+    last_err = None
+    for model in ["glm-4-flash-250414", "glm-4.5-flash", "glm-4.7-flash"]:
+        for attempt in range(2):
+            try:
+                body = {"model": model, "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.4, "max_tokens": 600,
+                        "thinking": {"type": "disabled"}}
+                req = urllib.request.Request(
+                    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+                    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                    headers={"Authorization": f"Bearer {key}",
+                             "Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=90) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                text = (data["choices"][0]["message"].get("content") or "").strip()
+                if text:
+                    return text
+                break
+            except urllib.error.HTTPError as e:
+                last_err = f"HTTP {e.code}"
+                if e.code == 401:
+                    return ""
+                if e.code == 429 and attempt < 1:
+                    time.sleep(2)
+                    continue
+                break
+            except Exception as e:
+                last_err = e
+                break
+    log(f"AI 分析失败（降级跳过）: {last_err}")
+    return ""
+
+
+def enrich(fresh: list, cfg: dict, now: datetime) -> dict:
+    """图表 + AI 分析编排，任何一步失败都降级（extras 对应项为 None）。"""
+    extras = {"img_key": None, "analysis": None, "quotes": None}
+    try:
+        quotes = fetch_quotes()
+        extras["quotes"] = quotes
+    except Exception as e:
+        log(f"行情获取失败（图表降级）: {e}")
+        quotes = []
+    if quotes:
+        try:
+            png = make_chart(quotes, now)
+            extras["img_key"] = upload_image(png)
+            log("行情图表已生成并上传")
+        except Exception as e:
+            log(f"图表生成/上传失败（降级跳过）: {e}")
+    if fresh:
+        titles = [it["title"] for it in fresh]
+        try:
+            extras["analysis"] = zhipu_analysis(titles, quotes)
+            if extras["analysis"]:
+                log("AI 今日解读已生成")
+        except Exception as e:
+            log(f"AI 分析异常（降级跳过）: {e}")
+    return extras
+
+def build_card(fresh: list, cfg: dict, now: datetime, extras: dict = None) -> dict:
+    extras = extras or {}
     buckets = {c: [] for c in CATEGORY_KEYS}
     other = []
     for it in fresh:
@@ -232,6 +413,13 @@ def build_card(items: list, cfg: dict, now: datetime) -> dict:
     icons = {"A股与国内宏观": "📈", "全球市场与美股": "🌍", "行业与公司动态": "🏢"}
     elements = []
     total = sum(len(v) for v in buckets.values()) + len(other)
+    if extras.get("img_key"):
+        elements.append({"tag": "img", "img_key": extras["img_key"],
+                         "alt": {"tag": "plain_text", "content": "全球主要指数涨跌幅图表"}})
+    if extras.get("analysis"):
+        elements.append({"tag": "markdown",
+                         "content": f"**🤖 AI 今日解读**\n{extras['analysis']}"})
+        elements.append({"tag": "hr"})
     if total == 0:
         elements.append({"tag": "markdown", "content": "今日暂无符合条件的新闻（数据源可能无更新）。"})
 
@@ -255,7 +443,8 @@ def build_card(items: list, cfg: dict, now: datetime) -> dict:
 
     elements.append({
         "tag": "note",
-        "elements": [{"tag": "plain_text", "content": f"共 {total} 条 ｜ 来源：华尔街见闻 · WSJ ｜ 本地机器人每日 08:00 自动推送"}],
+        "elements": [{"tag": "plain_text",
+                      "content": f"共 {total} 条 ｜ 来源：华尔街见闻 · WSJ ｜ 本地机器人每日 08:00 自动推送 ｜ AI 解读由 GLM 生成，仅供参考，不构成投资建议"}],
     })
 
     return {
@@ -349,6 +538,8 @@ def main():
     ap.add_argument("--config", default=str(BASE / "config.json"))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--test", action="store_true")
+    ap.add_argument("--preview", action="store_true",
+                    help="跳过去重与时间窗（演示新功能用），不更新去重状态")
     args = ap.parse_args()
 
     cfg = load_config(Path(args.config))
@@ -356,7 +547,10 @@ def main():
 
     if args.dry_run:
         items = fetch_all(cfg["feeds"])
-        card = build_card(items, cfg, now)
+        state = load_state()
+        fresh = filter_fresh(items, cfg, now, state)
+        extras = enrich(fresh, cfg, now)
+        card = build_card(fresh, cfg, now, extras)
         print(json.dumps({"msg_type": "interactive", "card": card}, ensure_ascii=False, indent=2))
         return
 
@@ -377,21 +571,26 @@ def main():
         sys.exit(2)
 
     state = load_state()
-    card = build_card(items, cfg, now)
-    total_note = card["elements"][-1]["elements"][0]["content"]
-    n = int(re.search(r"共 (\d+) 条", total_note).group(1)) if re.search(r"共 (\d+) 条", total_note) else 0
-    if n == 0:
+    fresh = filter_fresh(items, cfg, now, None if args.preview else state)
+    if not fresh:
         log("过滤后无新闻可推，跳过发送（不更新去重状态）。")
         return
+    extras = enrich(fresh, cfg, now)
+    card = build_card(fresh, cfg, now, extras)
+    total_note = card["elements"][-1]["elements"][0]["content"]
+    n = int(re.search(r"共 (\d+) 条", total_note).group(1)) if re.search(r"共 (\d+) 条", total_note) else 0
 
     ok = send_all(cfg, {"msg_type": "interactive", "card": card})
+    if args.preview:
+        log(f"预览推送完成（{n} 条，{ok} 个群送达），不更新去重状态。")
+        return
     if ok == 0:
         log("所有群均推送失败，不更新去重状态（下次重推）。")
         sys.exit(2)
     state["seen"].extend(it["link"] for it in items)
     state["last_push"] = now.isoformat()
     save_state(state)
-    log(f"推送完成，共 {n} 条，送达 {ok}/{len(cfg['webhook_url'].split(','))} 个群。")
+    log(f"推送完成，共 {n} 条，送达 {ok} 个群。")
 
 
 if __name__ == "__main__":
