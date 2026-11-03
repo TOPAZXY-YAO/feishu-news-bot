@@ -70,6 +70,7 @@ class Page:
         self.ax.plot([x0, x1], [y, y], color=color, lw=lw, solid_capstyle="butt")
 
     def text_block(self, x, y, text, w_frac, fs, max_lines=99, **kw):
+        text = " ".join(str(text).split())  # 折叠换行/连续空白，防 matplotlib 隐式换行导致叠字
         for ln in news._wrap(text, self.chars(w_frac, fs))[:max_lines]:
             y -= self.lh(fs)
             self.ax.text(x, y, ln, fontsize=fs, va="top", **kw)
@@ -177,6 +178,35 @@ def _style_chart_ax(ax):
         sp.set_color("#cccccc")
 
 
+def draw_quote_table(pg, x, y, w, quotes, history):
+    """指数行情表：名称/现价/当日%/30日%。返回结束 y。"""
+    hist_map = {h["name"]: h["chg30"] for h in history}
+    col_x = [x, x + w * 0.34, x + w * 0.60, x + w * 0.79]
+    headers = ["指数", "现价", "当日", "30日"]
+    pg.ax.text(x, y, "指数行情速览", fontsize=12.5, color=ACC, fontweight="bold", va="top")
+    y -= pg.lh(12.5) + 0.004
+    for cx, h in zip(col_x, headers):
+        pg.ax.text(cx, y, h, fontsize=9.5, color=SUB, fontweight="bold", va="top")
+    y -= pg.lh(9.5) + 0.002
+    row_h = pg.lh(10) + 0.0035
+    from matplotlib.patches import Rectangle
+    for i, q in enumerate(quotes):
+        if i % 2 == 0:
+            pg.ax.add_patch(Rectangle((x - 0.008, y - row_h * 0.85), w + 0.016, row_h,
+                                      fc="#f3efe3", ec="none", zorder=1))
+        c = UP if q["pct"] >= 0 else DOWN
+        h30 = hist_map.get(q["name"])
+        c30 = UP if (h30 or 0) >= 0 else DOWN
+        z30 = f"{h30:+.1f}%" if h30 is not None else "—"
+        pg.ax.text(col_x[0], y, q["name"], fontsize=10, color=INK, va="top", zorder=2)
+        pg.ax.text(col_x[1], y, f"{q['price']:,.2f}", fontsize=10, color=INK, va="top", zorder=2)
+        pg.ax.text(col_x[2], y, f"{q['pct']:+.2f}%", fontsize=10, color=c, va="top",
+                   fontweight="bold", zorder=2)
+        pg.ax.text(col_x[3], y, z30, fontsize=10, color=c30, va="top", zorder=2)
+        y -= row_h
+    return y
+
+
 # ---------- 四页渲染 ----------
 
 def render_pages(materials, layout, quotes, history, now, lead_img_url="") -> list:
@@ -214,14 +244,35 @@ def render_pages(materials, layout, quotes, history, now, lead_img_url="") -> li
     pg.rule(max(y - 0.012, 0.695), 1.0, "#bbbbbb")
     yy = min(y - 0.03, 0.665)
     pg.ax.text(0.05, yy + 0.014, "要闻", fontsize=12.5, color=ACC, fontweight="bold", va="top")
-    for t in layout["top"][:3]:
+    for t in layout["top"][:4]:
         yy = pg.text_block(0.05, yy, t["item"]["title"], 0.9, 12, color=INK, fontweight="bold")
         yy -= 0.003
         yy = pg.text_block(0.05, yy, t["summary"], 0.9, 9.8, color="#333333", max_lines=6)
         yy -= 0.012
         pg.rule(yy + 0.006, 0.5, "#dddddd")
         yy -= 0.010
-    pg.ax.text(0.5, 0.055, "—— 详见 第2版 全球市场 · 第3版 宏观产业 · 第4版 今日解读 ——",
+    # 更多要闻速览（未上头条/简讯的标题，两栏）
+    used = {t["item"]["title"] for t in layout["top"]} | {layout["lead"]["item"]["title"]}
+    for key in ("market_briefs", "cn_briefs", "industry_briefs"):
+        used |= {b["item"]["title"] for b in layout.get(key, [])}
+    more = [it for it in materials if it["title"] not in used][:6]
+    if more:
+        pg.rule(yy + 0.004, 1.2, "#bbbbbb")
+        pg.ax.text(0.05, yy - 0.020, "更多要闻", fontsize=12.5, color=ACC, fontweight="bold", va="top")
+        col_w, col_dx = 0.44, 0.47
+        rows = (len(more) + 1) // 2
+        for i, m in enumerate(more):
+            cx = 0.05 + (i % 2) * col_dx
+            ry = yy - 0.044 - (i // 2) * pg.lh(10) * 2.3
+            for ln in news._wrap(m["title"], pg.chars(col_w, 10))[:2]:
+                pg.ax.text(cx, ry, ln, fontsize=10, color=INK, va="top")
+                ry -= pg.lh(10)
+        yy = yy - 0.044 - rows * pg.lh(10) * 2.3 - 0.010
+    if quotes:
+        yy = draw_quote_table(pg, 0.05, max(yy - 0.024, 0.16), 0.9, quotes, history)
+    pg.ax.text(0.5, 0.048, "—— 详见 第2版 全球市场 · 第3版 宏观产业 · 第4版 今日解读 ——",
+               fontsize=9.5, color=SUB, ha="center")
+    pg.ax.text(0.5, 0.048, "—— 详见 第2版 全球市场 · 第3版 宏观产业 · 第4版 今日解读 ——",
                fontsize=9.5, color=SUB, ha="center")
     paths.append(pg.save("newspaper_p1.png"))
 
@@ -229,16 +280,16 @@ def render_pages(materials, layout, quotes, history, now, lead_img_url="") -> li
     pg = Page(plt)
     pg.masthead(now, 2)
     if quotes:
-        ax1 = pg.fig.add_axes([0.07, 0.60, 0.40, 0.27])
+        ax1 = pg.fig.add_axes([0.07, 0.55, 0.40, 0.345])
         draw_bar(ax1, quotes)
         _style_chart_ax(ax1)
     if history:
-        ax2 = pg.fig.add_axes([0.53, 0.60, 0.40, 0.27])
+        ax2 = pg.fig.add_axes([0.53, 0.55, 0.40, 0.345])
         draw_trend(ax2, history)
         _style_chart_ax(ax2)
-    pg.rule(0.575, 1.2, "#bbbbbb")
-    pg.ax.text(0.05, 0.555, "市场动态", fontsize=13, color=ACC, fontweight="bold", va="top")
-    yy = 0.555 - pg.lh(13) - 0.006
+    pg.rule(0.528, 1.2, "#bbbbbb")
+    pg.ax.text(0.05, 0.508, "市场动态", fontsize=13, color=ACC, fontweight="bold", va="top")
+    yy = 0.508 - pg.lh(13) - 0.006
     for b in layout.get("market_briefs", [])[:3]:
         yy = pg.text_block(0.05, yy, "▪ " + b["item"]["title"], 0.9, 11.5,
                            color=INK, fontweight="bold")
@@ -286,13 +337,15 @@ def render_pages(materials, layout, quotes, history, now, lead_img_url="") -> li
     pg.ax.text(0.05, 0.885, "深度综述", fontsize=15, color=ACC, fontweight="bold", va="top")
     yy = 0.885 - pg.lh(15) - 0.008
     for para in layout.get("review", "").split("\n\n"):
+        para = " ".join(para.split())
         for ln in news._wrap(para, pg.chars(0.9, 10.5)):
             yy -= pg.lh(10.5)
             pg.ax.text(0.05, yy, ln, fontsize=10.5, color="#2a2a2a", va="top")
         yy -= 0.012
     yy -= 0.010
     box_top = yy
-    n_lines = sum(len(news._wrap(c.lstrip("- "), pg.chars(0.83, 9.6))) for c in layout["comment"][:5])
+    comments = [" ".join(c.split()) for c in layout["comment"][:6]]
+    n_lines = sum(len(news._wrap(c.lstrip("- "), pg.chars(0.83, 9.6))) for c in comments)
     box_h = 0.032 + n_lines * pg.lh(9.6) + 0.012
     pg.ax.add_patch(FancyBboxPatch((0.05, box_top - box_h), 0.9, box_h,
                                    boxstyle="round,pad=0.006,rounding_size=0.010",
@@ -300,16 +353,27 @@ def render_pages(materials, layout, quotes, history, now, lead_img_url="") -> li
     pg.ax.text(0.072, box_top - 0.014, "今日要点与风险提示", fontsize=12.5,
                color=ACC, fontweight="bold", va="top")
     yy = box_top - 0.014 - pg.lh(12.5)
-    for c in layout["comment"][:5]:
+    for c in layout["comment"][:6]:
         for j, ln in enumerate(news._wrap(c.lstrip("- "), pg.chars(0.83, 9.6))[:2]):
             yy -= pg.lh(9.6)
             pg.ax.text(0.072, yy, ("▪ " if j == 0 else "   ") + ln,
                        fontsize=9.6, color="#2a2a2a", va="top")
-    pg.rule(box_top - box_h - 0.014, 0.6, "#999999")
-    pg.ax.text(0.05, box_top - box_h - 0.030,
-               "主编：DeepSeek ｜ 来源：华尔街见闻 · WSJ", fontsize=8.5, color=SUB)
-    pg.ax.text(0.95, box_top - box_h - 0.030, "AI 生成内容仅供参考，不构成投资建议",
-               fontsize=8.5, color=SUB, ha="right")
+    cal = layout.get("calendar", [])[:5]
+    if cal:
+        yy = box_top - box_h - 0.022
+        pg.ax.text(0.05, yy, "后续关注日历", fontsize=12.5, color=ACC, fontweight="bold", va="top")
+        yy -= pg.lh(12.5) + 0.004
+        for e in cal:
+            when = " ".join(str(e.get("when", "")).split())[:16]
+            event = " ".join(str(e.get("event", "")).split())
+            pg.ax.text(0.05, yy, when, fontsize=10, color=ACC, va="top", fontweight="bold")
+            for ln in news._wrap(event, pg.chars(0.74, 10))[:2]:
+                pg.ax.text(0.21, yy, ln, fontsize=10, color="#2a2a2a", va="top")
+                yy -= pg.lh(10)
+            yy -= 0.005
+    pg.rule(0.062, 0.6, "#999999")
+    pg.ax.text(0.05, 0.044, "主编：DeepSeek ｜ 来源：华尔街见闻 · WSJ", fontsize=8.5, color=SUB)
+    pg.ax.text(0.95, 0.044, "AI 生成内容仅供参考，不构成投资建议", fontsize=8.5, color=SUB, ha="right")
     paths.append(pg.save("newspaper_p4.png"))
 
     return paths
