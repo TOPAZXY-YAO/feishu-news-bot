@@ -456,26 +456,31 @@ def build_materials(fresh: list, max_items: int = 12, text_len: int = 420) -> li
 
 
 def ai_newspaper_full(materials: list, quotes: list) -> dict:
-    """AI 主编一次产出整份报纸内容：头条深度摘要 + 要闻 + 简讯 + 今日解读。
-    摘要基于素材正文（看图即懂，无需点链接）。失败抛异常。"""
+    """AI 主编产出四页报纸全部内容：头条深度报道 + 要闻 + 三组简讯 + 今日解读 + 深度综述。"""
     now = datetime.now(timezone(timedelta(hours=8)))
     idx_line = "；".join(f"{q['name']}{q['pct']:+.2f}%" for q in quotes)
     mat = "\n\n".join(
         f"【{m['no']}】{m['title']}\n{m['text'] or '（无正文，仅标题）'}" for m in materials)
     prompt = (
-        "你是财经早报主编，为一份「报纸图片版」组稿。基于素材正文撰写，让读者看图就能完全了解新闻内容，"
-        "绝不点链接。要求所有摘要信息完整（发生了什么+关键数字+为什么重要），数字只来自素材，不编造。\n"
-        "结构：\n"
-        "1. lead：从素材中选一条今日最重要新闻，写 100-150 字的完整报道式摘要。\n"
-        "2. top：再选 3 条重要新闻，各写 60-90 字完整摘要。\n"
-        "3. briefs：从剩余素材中挑 6 条，各写一句不超过 42 字的完整简讯（含关键信息，不是标题复读）。\n"
-        "4. comment：今日解读 3-4 条要点（每条≤40字）+ 最后一条风险提示（≤40字），每条以 - 开头。\n"
-        "英文素材也全部用中文。只输出 JSON（无其他文字/代码块标记）：\n"
+        "你是资深财经报纸主编，为一份四页「报纸图片版」组稿。基于素材正文撰写，读者看图即可完全了解新闻，"
+        "绝不点链接。所有摘要信息完整（发生了什么+关键数字+为何重要+后续关注什么），数字只来自素材，不编造。\n"
+        "1. lead：选今日最重要新闻，写 150-220 字深度报道（背景+事实+影响面）。\n"
+        "2. top：再选 3 条重要新闻，各写 100-140 字深度摘要。\n"
+        "3. market_briefs：全球市场相关 3 条，各 60-90 字。\n"
+        "4. cn_briefs：A股与国内宏观相关 3 条，各 60-90 字。\n"
+        "5. industry_briefs：行业与公司相关 3 条，各 60-90 字。\n"
+        "6. comment：今日解读 4 条要点（每条≤40字）+ 最后一条风险提示（≤40字），每条以 - 开头。\n"
+        "7. review：400-600 字深度市场综述，用两段分隔：第一段串联当日主线与逻辑，"
+        "第二段给出对后续 1-2 周的情景推演与观察点。观点鲜明、有逻辑链，不确定处注明。\n"
+        "英文素材全部用中文。只输出 JSON（无其他文字/代码块标记）：\n"
         '{"lead": {"no": 编号, "summary": "..."}, "top": [{"no": 编号, "summary": "..."}, ...3条], '
-        '"briefs": [{"no": 编号, "brief": "..."}, ...6条], "comment": ["- ...", ...]}\n\n'
+        '"market_briefs": [{"no": 编号, "brief": "..."}, ...3条], '
+        '"cn_briefs": [{"no": 编号, "brief": "..."}, ...3条], '
+        '"industry_briefs": [{"no": 编号, "brief": "..."}, ...3条], '
+        '"comment": ["- ...", ...], "review": "…"}\n\n'
         f"日期：{now.strftime('%Y-%m-%d %A')}\n指数表现：{idx_line}\n\n素材：\n{mat}"
     )
-    text = llm_complete([{"role": "user", "content": prompt}], max_tokens=1600, temperature=0.3)
+    text = llm_complete([{"role": "user", "content": prompt}], max_tokens=3000, temperature=0.35)
     m = re.search(r"\{.*\}", text, re.S)
     if not m:
         raise RuntimeError(f"AI 未返回 JSON: {text[:120]}")
@@ -489,26 +494,30 @@ def ai_newspaper_full(materials: list, quotes: list) -> dict:
     lead_no, lead_sum = pick(data.get("lead") or {}, "summary")
     if not lead_no:
         raise RuntimeError("AI 未选出头条")
-    top = []
-    for e in data.get("top", [])[:3]:
-        item, summary = pick(e, "summary")
-        if item:
-            top.append({"item": item, "summary": summary})
-    briefs = []
-    for e in data.get("briefs", [])[:8]:
-        item, brief = pick(e, "brief")
-        if item and brief:
-            briefs.append({"item": item, "brief": brief})
-    comment = [str(x) for x in data.get("comment", [])]
+
+    def group(key, field):
+        out = []
+        for e in data.get(key, []):
+            item, s = pick(e, field)
+            if item and s:
+                out.append({"item": item, field: s})
+        return out
+
+    review = str(data.get("review", "")).strip()
     return {"lead": {"item": lead_no, "summary": lead_sum},
-            "top": top, "briefs": briefs, "comment": comment}
+            "top": group("top", "summary"),
+            "market_briefs": group("market_briefs", "brief"),
+            "cn_briefs": group("cn_briefs", "brief"),
+            "industry_briefs": group("industry_briefs", "brief"),
+            "comment": [str(x) for x in data.get("comment", [])],
+            "review": review}
 
 
 def _wrap(text: str, width_units: float) -> list:
-    """中文按 1 个单位、ASCII 按 0.55 个单位贪心换行。"""
+    """中文按 1 个单位、ASCII 按 0.62 个单位贪心换行。"""
     lines, cur, w = [], [], 0.0
     for ch in text:
-        cw = 1.0 if ord(ch) > 0x2E80 else 0.55
+        cw = 1.0 if ord(ch) > 0x2E80 else 0.62
         if w + cw > width_units and cur:
             lines.append("".join(cur))
             cur, w = [], 0.0
@@ -695,7 +704,7 @@ def render_newspaper(materials: list, layout: dict, quotes: list, now: datetime,
 
 
 def build_newspaper(fresh: list, cfg: dict, now: datetime):
-    """完整报纸流水线：素材 → AI 组稿 → 渲染。成功返回 (png_path, layout)，失败返回 (None, 原因)。"""
+    """完整报纸流水线：素材 → AI 组稿 → 四页渲染。成功返回 (paths, layout)，失败返回 (None, 原因)。"""
     try:
         materials = build_materials(fresh)
         if not materials:
@@ -705,10 +714,17 @@ def build_newspaper(fresh: list, cfg: dict, now: datetime):
             quotes = fetch_quotes()
         except Exception as e:
             log(f"行情获取失败（报纸无指数条）: {e}")
+        history = []
+        try:
+            import newspaper_pages as npages
+            history = npages.fetch_history()
+        except Exception as e:
+            log(f"K线历史获取失败（走势图降级）: {e}")
         layout = ai_newspaper_full(materials, quotes)
         lead_img = layout["lead"]["item"].get("img_url", "")
-        path = render_newspaper(materials, layout, quotes, now, lead_img)
-        return path, layout
+        import newspaper_pages as npages
+        paths = npages.render_pages(materials, layout, quotes, history, now, lead_img)
+        return paths, layout
     except Exception as e:
         return None, f"{type(e).__name__}: {e}"
 
@@ -933,9 +949,9 @@ def main():
         items = fetch_all(cfg["feeds"])
         state = load_state()
         fresh = filter_fresh(items, cfg, now, state)
-        path, _meta = build_newspaper(fresh, cfg, now)
-        if path:
-            log(f"报纸图片已生成: {path}")
+        paths, _meta = build_newspaper(fresh, cfg, now)
+        if paths:
+            log(f"报纸已生成 {len(paths)} 页: " + ", ".join(Path(p).name for p in paths))
             return
         log(f"报纸生成失败（{_meta}），降级输出卡片 JSON")
         extras = enrich(fresh, cfg, now)
@@ -965,22 +981,26 @@ def main():
         log("过滤后无新闻可推，跳过发送（不更新去重状态）。")
         return
 
-    # 主路径：报纸图片版
-    path, _meta = build_newspaper(fresh, cfg, now)
-    if path:
+    # 主路径：四页报纸图片版
+    paths, _meta = build_newspaper(fresh, cfg, now)
+    if paths:
         try:
-            img_key = upload_image_bytes(open(path, "rb").read())
-            ok = send_all(cfg, {"msg_type": "image", "content": {"image_key": img_key}})
+            total_ok = 0
+            for i, path in enumerate(paths, 1):
+                img_key = upload_image_bytes(open(path, "rb").read())
+                ok = send_all(cfg, {"msg_type": "image", "content": {"image_key": img_key}})
+                total_ok += ok
+                log(f"第{i}版推送完成（{ok} 个群）")
             if args.preview:
-                log(f"预览推送完成（报纸图片，{ok} 个群送达），不更新去重状态。")
+                log(f"预览推送完成（{len(paths)} 页报纸，累计送达 {total_ok} 次），不更新去重状态。")
                 return
-            if ok == 0:
+            if total_ok == 0:
                 log("所有群均推送失败，不更新去重状态（下次重推）。")
                 sys.exit(2)
             state["seen"].extend(it["link"] for it in items)
             state["last_push"] = now.isoformat()
             save_state(state)
-            log(f"报纸图片推送完成，送达 {ok} 个群。")
+            log(f"报纸推送完成：{len(paths)} 版 × {total_ok // max(len(paths),1)} 个群。")
             return
         except Exception as e:
             log(f"报纸图片上传/推送失败，降级卡片: {e}")
