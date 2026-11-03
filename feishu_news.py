@@ -283,8 +283,8 @@ def make_chart(quotes: list, now: datetime) -> str:
     return path
 
 
-def upload_image(png_path: str) -> str:
-    """用小财应用凭证上传图片，返回 image_key（需应用有 im:resource 权限）。"""
+def upload_image_bytes(img: bytes) -> str:
+    """上传图片字节，返回 image_key（需应用有 im:resource 权限）。"""
     app_id = os.environ.get("FEISHU_APP_ID", "")
     app_secret = os.environ.get("FEISHU_APP_SECRET", "")
     if not app_id or not app_secret:
@@ -298,13 +298,11 @@ def upload_image(png_path: str) -> str:
 
     import uuid
     boundary = uuid.uuid4().hex
-    with open(png_path, "rb") as f:
-        img_bytes = f.read()
     body = (f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="image_type"\r\n\r\nmessage\r\n'
             f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="image"; filename="chart.png"\r\n'
-            f"Content-Type: image/png\r\n\r\n").encode() + img_bytes + \
+            f'Content-Disposition: form-data; name="image"; filename="img.png"\r\n'
+            f"Content-Type: application/octet-stream\r\n\r\n").encode() + img + \
         f"\r\n--{boundary}--\r\n".encode()
     req = urllib.request.Request(
         "https://open.feishu.cn/open-apis/im/v1/images", data=body, method="POST",
@@ -315,6 +313,17 @@ def upload_image(png_path: str) -> str:
     if result.get("code") != 0:
         raise RuntimeError(f"图片上传失败: {result.get('msg')}")
     return result["data"]["image_key"]
+
+
+def upload_image(png_path: str) -> str:
+    with open(png_path, "rb") as f:
+        return upload_image_bytes(f.read())
+
+
+def extract_first_img(desc: str) -> str:
+    """从 RSS description 的 HTML 里提取第一张图片 URL。"""
+    m = re.search(r'<img[^>]+src="(https?://[^"]+)"', desc or "")
+    return m.group(1) if m else ""
 
 
 def _llm_request(provider: str, model: str, key: str, messages: list, max_tokens: int, temperature: float):
@@ -370,31 +379,64 @@ def llm_complete(messages: list, max_tokens: int = 600, temperature: float = 0.4
     raise RuntimeError(f"所有模型均失败: {last_err}")
 
 
-def zhipu_analysis(headlines: list, quotes: list) -> str:
-    """生成今日解读（3-4 条要点 + 风险提示），DeepSeek 优先；失败返回空串。"""
+def ai_newspaper(headlines: list, quotes: list):
+    """AI 主编：从要闻中筛选 6 条最重要新闻（各配一句摘要）+ 写今日解读。
+    返回 (analysis: str, top: list[dict])；失败抛异常由调用方降级。"""
     now = datetime.now(timezone(timedelta(hours=8)))
     idx_line = " ".join(f"{q['name']}{q['pct']:+.2f}%" for q in quotes)
+    numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(headlines[:30]))
     prompt = (
-        "你是财经早报编辑。基于下面的隔夜与近期要闻标题、以及全球主要指数表现，"
-        "写一份简短的「今日解读」：3-4 条要点（每条不超过40字，指出市场主线、"
-        "逻辑或值得关注的信号）+ 最后单独一条风险提示（不超过40字）。\n"
-        "要求：中文；直接输出条目，每条一行以 - 开头；不要客套话和总结；"
-        "不编造标题之外的具体数字。\n\n"
+        "你是财经早报主编。完成两项任务：\n"
+        "任务一「今日解读」：基于要闻与指数表现，写 3-4 条要点（每条≤40字，指出市场主线/逻辑/信号）"
+        "+ 最后一条风险提示（≤40字）。\n"
+        "任务二「头条筛选」：从要闻中挑出 6 条最重要的，按重要性排序，各配一句不超过40字的中文摘要"
+        "（英文新闻也用中文摘要），不编造标题之外的信息。\n"
+        "只输出一个 JSON 对象，不要任何其他文字或代码块标记：\n"
+        '{"analysis": ["- 要点1", "- 要点2", "- 要点3", "- ⚠️ 风险提示"], '
+        '"top": [{"no": 标题编号数字, "summary": "一句摘要"}, ...共6条]}\n\n'
         f"日期：{now.strftime('%Y-%m-%d %A')}\n"
-        f"指数表现：{idx_line}\n"
-        "要闻标题：\n" + "\n".join(f"- {t}" for t in headlines[:12])
+        f"指数表现：{idx_line}\n要闻标题：\n{numbered}"
     )
-    try:
-        text = llm_complete([{"role": "user", "content": prompt}], max_tokens=600, temperature=0.4)
-        return text
-    except Exception as e:
-        log(f"AI 分析失败（降级跳过）: {e}")
-        return ""
+    text = llm_complete([{"role": "user", "content": prompt}], max_tokens=900, temperature=0.3)
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        raise RuntimeError(f"AI 未返回 JSON: {text[:120]}")
+    data = json.loads(m.group(0))
+    analysis = "\n".join(str(x) for x in data.get("analysis", []))
+    top = []
+    for p in data.get("top", [])[:6]:
+        try:
+            idx = int(p["no"]) - 1
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < len(headlines):
+            top.append({"title": headlines[idx], "summary": str(p.get("summary", "")).strip()})
+    if not top:
+        raise RuntimeError("AI 未选出头条")
+    return analysis, top
+
+
+def attach_front_images(front: list, fresh: list, max_images: int = 3):
+    """为前几条头条下载并上传配图（原图来自 RSS description）。"""
+    by_title = {it["title"]: it for it in fresh}
+    n_img = 0
+    for t in front:
+        if n_img >= max_images:
+            break
+        it = by_title.get(t["title"])
+        img_url = extract_first_img(it.get("desc", "")) if it else ""
+        if not img_url:
+            continue
+        try:
+            t["img_key"] = upload_image_bytes(http_get(img_url, timeout=30))
+            n_img += 1
+        except Exception as e:
+            log(f"头条配图失败（跳过）: {e}")
 
 
 def enrich(fresh: list, cfg: dict, now: datetime) -> dict:
-    """图表 + AI 分析编排，任何一步失败都降级（extras 对应项为 None）。"""
-    extras = {"img_key": None, "analysis": None, "quotes": None}
+    """图表 + AI 主编编排，任何一步失败都降级（extras 对应项为 None）。"""
+    extras = {"img_key": None, "analysis": None, "quotes": None, "front": None}
     try:
         quotes = fetch_quotes()
         extras["quotes"] = quotes
@@ -411,22 +453,28 @@ def enrich(fresh: list, cfg: dict, now: datetime) -> dict:
     if fresh:
         titles = [it["title"] for it in fresh]
         try:
-            extras["analysis"] = zhipu_analysis(titles, quotes)
-            if extras["analysis"]:
-                log("AI 今日解读已生成")
+            analysis, front = ai_newspaper(titles, quotes)
+            extras["analysis"] = analysis
+            attach_front_images(front, fresh)
+            extras["front"] = front
+            log(f"AI 主编完成：头条 {len(front)} 条")
         except Exception as e:
-            log(f"AI 分析异常（降级跳过）: {e}")
+            log(f"AI 主编失败（降级全量布局）: {e}")
     return extras
 
 def build_card(fresh: list, cfg: dict, now: datetime, extras: dict = None) -> dict:
     extras = extras or {}
+    front = extras.get("front") or []          # AI 筛选的头条 [{title, summary, img_key?}]
+    front_titles = {t["title"] for t in front}
+    overview_cap = 3                            # 速览每类条数（头条已承担重要新闻）
+
     buckets = {c: [] for c in CATEGORY_KEYS}
     other = []
     for it in fresh:
         cat = classify(it)
-        if cat and len(buckets[cat]) < cfg["max_per_category"]:
+        if cat and len(buckets[cat]) < overview_cap:
             buckets[cat].append(it)
-        elif not cat and len(other) < cfg["max_other"]:
+        elif not cat and len(other) < overview_cap:
             other.append(it)
 
     for c in buckets:
@@ -437,7 +485,7 @@ def build_card(fresh: list, cfg: dict, now: datetime, extras: dict = None) -> di
     greeting = "早安财经日报" if now.hour < 11 else ("午间财经速递" if now.hour < 17 else "晚间财经要闻")
     icons = {"A股与国内宏观": "📈", "全球市场与美股": "🌍", "行业与公司动态": "🏢"}
     elements = []
-    total = sum(len(v) for v in buckets.values()) + len(other)
+
     if extras.get("img_key"):
         elements.append({"tag": "img", "img_key": extras["img_key"],
                          "alt": {"tag": "plain_text", "content": "全球主要指数涨跌幅图表"}})
@@ -445,7 +493,34 @@ def build_card(fresh: list, cfg: dict, now: datetime, extras: dict = None) -> di
         elements.append({"tag": "markdown",
                          "content": f"**🤖 AI 今日解读**\n{extras['analysis']}"})
         elements.append({"tag": "hr"})
-    if total == 0:
+
+    # 报纸头版：头条聚焦（图文混排）
+    if front:
+        by_title = {it["title"]: it for it in fresh}
+        elements.append({"tag": "markdown", "content": "**📰 头条聚焦**"})
+        for i, t in enumerate(front):
+            link = (by_title.get(t["title"]) or {}).get("link", "#")
+            entry = f"**[{t['title']}]({link})**"
+            if t.get("summary"):
+                entry += f"\n{t['summary']}"
+            if i < 3 and t.get("img_key"):
+                elements.append({"tag": "column_set", "flex_mode": "bisect",
+                                 "columns": [
+                                     {"tag": "column", "width": "weighted", "weight": 3,
+                                      "vertical_align": "top",
+                                      "elements": [{"tag": "markdown", "content": entry}]},
+                                     {"tag": "column", "width": "weighted", "weight": 2,
+                                      "vertical_align": "top",
+                                      "elements": [{"tag": "img", "img_key": t["img_key"],
+                                                    "alt": {"tag": "plain_text",
+                                                            "content": "头条配图"}}]},
+                                 ]})
+            else:
+                elements.append({"tag": "markdown", "content": f"- {entry}"})
+        elements.append({"tag": "hr"})
+
+    total = sum(len(v) for v in buckets.values()) + len(other)
+    if not elements:
         elements.append({"tag": "markdown", "content": "今日暂无符合条件的新闻（数据源可能无更新）。"})
 
     for cat, its in buckets.items():
@@ -453,10 +528,13 @@ def build_card(fresh: list, cfg: dict, now: datetime, extras: dict = None) -> di
             continue
         lines = [f"**{icons[cat]} {cat}**"]
         for it in its:
+            if it["title"] in front_titles:
+                continue  # 已在头条展示，速览不重复
             src = f"（{it['source']}）" if it["source"] == "WSJ" else ""
             lines.append(f"- [{it['title']}]({it['link']}){src}")
-        elements.append({"tag": "markdown", "content": "\n".join(lines)})
-        elements.append({"tag": "hr"})
+        if len(lines) > 1:
+            elements.append({"tag": "markdown", "content": "\n".join(lines)})
+            elements.append({"tag": "hr"})
     if other:
         lines = ["**📌 其他要闻**"]
         for it in other:
@@ -469,14 +547,16 @@ def build_card(fresh: list, cfg: dict, now: datetime, extras: dict = None) -> di
     elements.append({
         "tag": "note",
         "elements": [{"tag": "plain_text",
-                      "content": f"共 {total} 条 ｜ 来源：华尔街见闻 · WSJ ｜ 本地机器人每日 08:00 自动推送 ｜ AI 解读由 GLM 生成，仅供参考，不构成投资建议"}],
+                      "content": f"来源：华尔街见闻 · WSJ ｜ 头条与解读由 DeepSeek 生成，仅供参考，不构成投资建议 ｜ 每日 08:00 自动推送"}],
     })
 
+    issue_no = (now.date() - datetime(2026, 10, 25).date()).days + 1  # 2026-10-25 创刊
     return {
         "config": {"wide_screen_mode": True},
         "header": {
             "template": "orange",
-            "title": {"tag": "plain_text", "content": f"☕ {greeting} · {date_str}"},
+            "title": {"tag": "plain_text",
+                      "content": f"☕ {greeting} 第{issue_no}期 · {date_str}"},
         },
         "elements": elements,
     }
