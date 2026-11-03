@@ -317,11 +317,61 @@ def upload_image(png_path: str) -> str:
     return result["data"]["image_key"]
 
 
+def _llm_request(provider: str, model: str, key: str, messages: list, max_tokens: int, temperature: float):
+    """构造各厂商的 chat completions 请求（均为 OpenAI 兼容格式）。"""
+    if provider == "deepseek":
+        url = "https://api.deepseek.com/chat/completions"
+        body = {"model": model, "messages": messages, "temperature": temperature,
+                "max_tokens": max_tokens}
+    else:  # zhipu
+        url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        body = {"model": model, "messages": messages, "temperature": temperature,
+                "max_tokens": max_tokens, "thinking": {"type": "disabled"}}
+    return urllib.request.Request(
+        url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+
+
+def llm_complete(messages: list, max_tokens: int = 600, temperature: float = 0.4) -> str:
+    """非流式 LLM 调用：DeepSeek 主力，智谱免费模型兜底；全失败抛异常。"""
+    deepseek = os.environ.get("DEEPSEEK_API_KEY", "")
+    zhipu = os.environ.get("ZHIPU_API_KEY", "")
+    attempts = []
+    if deepseek:
+        attempts.append(("deepseek", "deepseek-chat", deepseek))
+    if zhipu:
+        attempts += [("zhipu", m, zhipu) for m in
+                     ("glm-4-flash-250414", "glm-4.5-flash", "glm-4.7-flash")]
+    if not attempts:
+        raise RuntimeError("未配置任何 LLM API Key")
+    last_err = None
+    for provider, model, key in attempts:
+        for attempt in range(2):
+            try:
+                req = _llm_request(provider, model, key, messages, max_tokens, temperature)
+                with urllib.request.urlopen(req, timeout=90) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                text = (data["choices"][0]["message"].get("content") or "").strip()
+                if text:
+                    return text
+                last_err = "空回复"
+                break
+            except urllib.error.HTTPError as e:
+                last_err = f"HTTP {e.code}"
+                if e.code in (401, 402):  # key 无效/余额不足，换下一家
+                    break
+                if e.code == 429 and attempt < 1:
+                    time.sleep(2)
+                    continue
+                break
+            except Exception as e:
+                last_err = e
+                break
+    raise RuntimeError(f"所有模型均失败: {last_err}")
+
+
 def zhipu_analysis(headlines: list, quotes: list) -> str:
-    """智谱免费模型生成今日解读（3-4 条要点 + 风险提示），失败返回空串。"""
-    key = os.environ.get("ZHIPU_API_KEY", "")
-    if not key:
-        return ""
+    """生成今日解读（3-4 条要点 + 风险提示），DeepSeek 优先；失败返回空串。"""
     now = datetime.now(timezone(timedelta(hours=8)))
     idx_line = " ".join(f"{q['name']}{q['pct']:+.2f}%" for q in quotes)
     prompt = (
@@ -334,37 +384,12 @@ def zhipu_analysis(headlines: list, quotes: list) -> str:
         f"指数表现：{idx_line}\n"
         "要闻标题：\n" + "\n".join(f"- {t}" for t in headlines[:12])
     )
-    last_err = None
-    for model in ["glm-4-flash-250414", "glm-4.5-flash", "glm-4.7-flash"]:
-        for attempt in range(2):
-            try:
-                body = {"model": model, "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.4, "max_tokens": 600,
-                        "thinking": {"type": "disabled"}}
-                req = urllib.request.Request(
-                    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-                    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                    headers={"Authorization": f"Bearer {key}",
-                             "Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=90) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                text = (data["choices"][0]["message"].get("content") or "").strip()
-                if text:
-                    return text
-                break
-            except urllib.error.HTTPError as e:
-                last_err = f"HTTP {e.code}"
-                if e.code == 401:
-                    return ""
-                if e.code == 429 and attempt < 1:
-                    time.sleep(2)
-                    continue
-                break
-            except Exception as e:
-                last_err = e
-                break
-    log(f"AI 分析失败（降级跳过）: {last_err}")
-    return ""
+    try:
+        text = llm_complete([{"role": "user", "content": prompt}], max_tokens=600, temperature=0.4)
+        return text
+    except Exception as e:
+        log(f"AI 分析失败（降级跳过）: {e}")
+        return ""
 
 
 def enrich(fresh: list, cfg: dict, now: datetime) -> dict:
