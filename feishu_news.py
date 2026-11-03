@@ -434,6 +434,285 @@ def attach_front_images(front: list, fresh: list, max_images: int = 3):
             log(f"头条配图失败（跳过）: {e}")
 
 
+# ---------- 报纸图片版 ----------
+
+def strip_html(s: str) -> str:
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def build_materials(fresh: list, max_items: int = 12, text_len: int = 420) -> list:
+    """把 fresh 条目转成 AI 素材：编号 + 标题 + 正文截取 + 首图 URL。"""
+    materials = []
+    for i, it in enumerate(fresh[:max_items]):
+        materials.append({
+            "no": i + 1,
+            "title": it["title"],
+            "text": strip_html(it.get("desc", ""))[:text_len],
+            "img_url": extract_first_img(it.get("desc", "")),
+            "item": it,
+        })
+    return materials
+
+
+def ai_newspaper_full(materials: list, quotes: list) -> dict:
+    """AI 主编一次产出整份报纸内容：头条深度摘要 + 要闻 + 简讯 + 今日解读。
+    摘要基于素材正文（看图即懂，无需点链接）。失败抛异常。"""
+    now = datetime.now(timezone(timedelta(hours=8)))
+    idx_line = "；".join(f"{q['name']}{q['pct']:+.2f}%" for q in quotes)
+    mat = "\n\n".join(
+        f"【{m['no']}】{m['title']}\n{m['text'] or '（无正文，仅标题）'}" for m in materials)
+    prompt = (
+        "你是财经早报主编，为一份「报纸图片版」组稿。基于素材正文撰写，让读者看图就能完全了解新闻内容，"
+        "绝不点链接。要求所有摘要信息完整（发生了什么+关键数字+为什么重要），数字只来自素材，不编造。\n"
+        "结构：\n"
+        "1. lead：从素材中选一条今日最重要新闻，写 100-150 字的完整报道式摘要。\n"
+        "2. top：再选 3 条重要新闻，各写 60-90 字完整摘要。\n"
+        "3. briefs：从剩余素材中挑 6 条，各写一句不超过 42 字的完整简讯（含关键信息，不是标题复读）。\n"
+        "4. comment：今日解读 3-4 条要点（每条≤40字）+ 最后一条风险提示（≤40字），每条以 - 开头。\n"
+        "英文素材也全部用中文。只输出 JSON（无其他文字/代码块标记）：\n"
+        '{"lead": {"no": 编号, "summary": "..."}, "top": [{"no": 编号, "summary": "..."}, ...3条], '
+        '"briefs": [{"no": 编号, "brief": "..."}, ...6条], "comment": ["- ...", ...]}\n\n'
+        f"日期：{now.strftime('%Y-%m-%d %A')}\n指数表现：{idx_line}\n\n素材：\n{mat}"
+    )
+    text = llm_complete([{"role": "user", "content": prompt}], max_tokens=1600, temperature=0.3)
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        raise RuntimeError(f"AI 未返回 JSON: {text[:120]}")
+    data = json.loads(m.group(0))
+    by_no = {m["no"]: m for m in materials}
+
+    def pick(entry, field):
+        no = int(entry.get("no", 0))
+        return by_no.get(no), str(entry.get(field, "")).strip()
+
+    lead_no, lead_sum = pick(data.get("lead") or {}, "summary")
+    if not lead_no:
+        raise RuntimeError("AI 未选出头条")
+    top = []
+    for e in data.get("top", [])[:3]:
+        item, summary = pick(e, "summary")
+        if item:
+            top.append({"item": item, "summary": summary})
+    briefs = []
+    for e in data.get("briefs", [])[:8]:
+        item, brief = pick(e, "brief")
+        if item and brief:
+            briefs.append({"item": item, "brief": brief})
+    comment = [str(x) for x in data.get("comment", [])]
+    return {"lead": {"item": lead_no, "summary": lead_sum},
+            "top": top, "briefs": briefs, "comment": comment}
+
+
+def _wrap(text: str, width_units: float) -> list:
+    """中文按 1 个单位、ASCII 按 0.55 个单位贪心换行。"""
+    lines, cur, w = [], [], 0.0
+    for ch in text:
+        cw = 1.0 if ord(ch) > 0x2E80 else 0.55
+        if w + cw > width_units and cur:
+            lines.append("".join(cur))
+            cur, w = [], 0.0
+            if ch == " ":
+                continue
+        cur.append(ch)
+        w += cw
+    if cur:
+        lines.append("".join(cur))
+    return lines
+
+
+def render_newspaper(materials: list, layout: dict, quotes: list, now: datetime,
+                     lead_img_url: str = "") -> str:
+    """渲染整版报纸 PNG，返回文件路径。版面用动态游标布局（行高与宽度按字号精确计算）。"""
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import font_manager, pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+
+    for cand in ("Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "WenQuanYi Zen Hei"):
+        if any(f.name == cand for f in font_manager.fontManager.ttflist):
+            plt.rcParams["font.family"] = cand
+            break
+    plt.rcParams["axes.unicode_minus"] = False
+
+    BG, INK, SUB, ACC = "#fbf9f1", "#1a1a1a", "#555555", "#8c1f1f"
+    UP, DOWN = "#c93030", "#1a9e5c"
+    FIG_W, FIG_H = 10.0, 12.3
+    issue_no = (now.date() - datetime(2026, 10, 25).date()).days + 1
+
+    fig = plt.figure(figsize=(FIG_W, FIG_H), dpi=150)
+    fig.patch.set_facecolor(BG)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+
+    def chars(w_frac, fs):
+        """宽 w_frac 的区域内，字号 fs 每行可容纳的全角字符数。"""
+        return w_frac * FIG_W * 72 / fs
+
+    def lh(fs):
+        """字号 fs 的一行高度（画布高度比例），1.45 倍行距。"""
+        return fs * 1.45 / (72 * FIG_H)
+
+    def rule(y, lw=1.6, color=INK, x0=0.05, x1=0.95):
+        ax.plot([x0, x1], [y, y], color=color, lw=lw, solid_capstyle="butt")
+
+    def text_block(x, y, text, w_frac, fs, **kw):
+        """画自动换行文本块，返回新的 y。kw 含 color/weight 等。"""
+        for ln in _wrap(text, chars(w_frac, fs)):
+            y -= lh(fs)
+            ax.text(x, y, ln, fontsize=fs, va="top", **kw)
+        return y
+
+    # ── 报头 ──
+    ax.text(0.5, 0.972, "早安财经日报", ha="center", va="center",
+            fontsize=34, fontweight="bold", color=INK)
+    ax.text(0.05, 0.968, f"第 {issue_no} 期", ha="left", va="center", fontsize=11, color=SUB)
+    ax.text(0.95, 0.968, now.strftime("%Y年%m月%d日 %A"), ha="right", va="center",
+            fontsize=11, color=SUB)
+    rule(0.9515, 2.2)
+    rule(0.9475, 0.6)
+
+    # ── 指数速览条 ──
+    y0 = 0.924
+    if quotes:
+        n = len(quotes)
+        for i, q in enumerate(quotes):
+            x = 0.055 + i * (0.89 / n)
+            color = UP if q["pct"] >= 0 else DOWN
+            ax.text(x, y0 + 0.011, q["name"], fontsize=8.2, color=SUB, ha="left")
+            ax.text(x, y0 - 0.009, f"{q['pct']:+.2f}%", fontsize=10.5,
+                    color=color, ha="left", fontweight="bold")
+    rule(0.899, 0.7, "#999999")
+
+    # ── 头条（左文右图，动态游标）──
+    lead = layout["lead"]
+    it = lead["item"]
+    ax.text(0.05, 0.884, "今日头条", fontsize=11, color=ACC, fontweight="bold", ha="left")
+    ax.text(0.125, 0.884, it["title"][:38], fontsize=9, color="#999999", ha="left", va="center")
+
+    y = 0.872
+    y = text_block(0.05, y, it["title"], 0.55, 15.5, color=INK, fontweight="bold")
+    y -= 0.006
+    y = text_block(0.05, y, lead["summary"], 0.55, 10.8, color="#2a2a2a")
+    if y > 0.705:
+        y = 0.705  # 头条区下限
+    lead_bottom = y
+    if lead_img_url:
+        try:
+            import io
+            from PIL import Image
+            img = Image.open(io.BytesIO(http_get(lead_img_url, timeout=30)))
+            img_top, img_h = 0.872, max(0.10, min(0.17, 0.872 - lead_bottom - 0.01))
+            ax_img = fig.add_axes([0.645, img_top - img_h, 0.305, img_h])
+            ax_img.imshow(img, aspect="auto")
+            ax_img.set_xticks([])
+            ax_img.set_yticks([])
+            for sp in ax_img.spines.values():
+                sp.set_color("#cccccc")
+        except Exception as e:
+            log(f"头条配图加载失败（纯文字版式）: {e}")
+    rule(max(lead_bottom - 0.012, 0.70), 1.0, "#bbbbbb")
+
+    # ── 要闻（3 条：标题+摘要，动态游标）──
+    y = min(lead_bottom - 0.03, 0.672)
+    for t in layout["top"][:3]:
+        item = t["item"]
+        y = text_block(0.05, y, item["title"], 0.9, 12, color=INK, fontweight="bold")
+        y -= 0.003
+        y = text_block(0.05, y, t["summary"], 0.9, 9.8, color="#333333")
+        y -= 0.010
+        rule(y + 0.006, 0.5, "#dddddd")
+        y -= 0.010
+
+    # ── 三栏简讯 ──
+    cols_top = y - 0.014
+    col_w = 0.292
+    briefs = layout["briefs"]
+
+    def cat_of(item):
+        fake = {"title": item["title"], "desc": item.get("text", ""), "dt": None,
+                "source": item["item"]["source"]}
+        return classify(fake)
+
+    buckets = {0: [], 1: [], 2: []}
+    order = {0: "A股与国内宏观", 1: "全球市场与美股", 2: "行业与公司动态"}
+    rest = []
+    for b in briefs:
+        slot = next((k for k, v in order.items() if v == cat_of(b["item"])), None)
+        if slot is not None and len(buckets[slot]) < 2:
+            buckets[slot].append(b)
+        else:
+            rest.append(b)
+    for k in buckets:
+        while len(buckets[k]) < 2 and rest:
+            buckets[k].append(rest.pop(0))
+
+    cols_bottom = cols_top
+    for k, title in enumerate(["A股·宏观", "全球市场", "行业·公司"]):
+        x = 0.05 + k * (col_w + 0.031)
+        ax.plot([x - 0.014, x - 0.014], [cols_top + 0.004, cols_top - 0.205],
+                color="#dddddd", lw=0.8)
+        ax.text(x, cols_top, title, fontsize=12.5, color=ACC, fontweight="bold", va="top")
+        yy = cols_top - lh(12.5) - 0.004
+        for b in buckets[k][:2]:
+            yy = text_block(x, yy, "▪ " + b["item"]["title"], col_w, 9.6,
+                            color=INK, fontweight="bold")
+            yy = text_block(x, yy, b["brief"], col_w, 8.8, color="#333333")
+            yy -= 0.008
+        cols_bottom = min(cols_bottom, yy)
+
+    # ── 今日解读框 ──
+    box_top = cols_bottom - 0.016
+    n_lines = sum(len(_wrap(c.lstrip("- "), chars(0.83, 9.6))) for c in layout["comment"][:5])
+    box_h = 0.032 + n_lines * lh(9.6) + 0.012
+    ax.add_patch(FancyBboxPatch((0.05, box_top - box_h), 0.9, box_h,
+                                boxstyle="round,pad=0.006,rounding_size=0.010",
+                                fc="#f2ede2", ec="#c9b98a", lw=1.0))
+    ax.text(0.072, box_top - 0.014, "今日解读", fontsize=12.5,
+            color=ACC, fontweight="bold", va="top")
+    yy = box_top - 0.014 - lh(12.5)
+    for c in layout["comment"][:5]:
+        wrapped = _wrap(c.lstrip("- "), chars(0.83, 9.6))
+        for j, ln in enumerate(wrapped[:2]):
+            yy -= lh(9.6)
+            ax.text(0.072, yy, ("▪ " if j == 0 else "   ") + ln,
+                    fontsize=9.6, color="#2a2a2a", va="top")
+
+    # ── 页脚 ──
+    rule(box_top - box_h - 0.014, 0.6, "#999999")
+    ax.text(0.05, box_top - box_h - 0.030,
+            f"来源：华尔街见闻 · WSJ ｜ 主编：DeepSeek ｜ 第 {issue_no} 期",
+            fontsize=8.5, color=SUB)
+    ax.text(0.95, box_top - box_h - 0.030, "AI 生成内容仅供参考，不构成投资建议",
+            fontsize=8.5, color=SUB, ha="right")
+
+    path = str(BASE / "newspaper.png")
+    fig.savefig(path, facecolor=BG)
+    plt.close(fig)
+    return path
+
+
+def build_newspaper(fresh: list, cfg: dict, now: datetime):
+    """完整报纸流水线：素材 → AI 组稿 → 渲染。成功返回 (png_path, layout)，失败返回 (None, 原因)。"""
+    try:
+        materials = build_materials(fresh)
+        if not materials:
+            return None, "无素材"
+        quotes = []
+        try:
+            quotes = fetch_quotes()
+        except Exception as e:
+            log(f"行情获取失败（报纸无指数条）: {e}")
+        layout = ai_newspaper_full(materials, quotes)
+        lead_img = layout["lead"]["item"].get("img_url", "")
+        path = render_newspaper(materials, layout, quotes, now, lead_img)
+        return path, layout
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
 def enrich(fresh: list, cfg: dict, now: datetime) -> dict:
     """图表 + AI 主编编排，任何一步失败都降级（extras 对应项为 None）。"""
     extras = {"img_key": None, "analysis": None, "quotes": None, "front": None}
@@ -654,6 +933,11 @@ def main():
         items = fetch_all(cfg["feeds"])
         state = load_state()
         fresh = filter_fresh(items, cfg, now, state)
+        path, _meta = build_newspaper(fresh, cfg, now)
+        if path:
+            log(f"报纸图片已生成: {path}")
+            return
+        log(f"报纸生成失败（{_meta}），降级输出卡片 JSON")
         extras = enrich(fresh, cfg, now)
         card = build_card(fresh, cfg, now, extras)
         print(json.dumps({"msg_type": "interactive", "card": card}, ensure_ascii=False, indent=2))
@@ -680,14 +964,35 @@ def main():
     if not fresh:
         log("过滤后无新闻可推，跳过发送（不更新去重状态）。")
         return
+
+    # 主路径：报纸图片版
+    path, _meta = build_newspaper(fresh, cfg, now)
+    if path:
+        try:
+            img_key = upload_image_bytes(open(path, "rb").read())
+            ok = send_all(cfg, {"msg_type": "image", "content": {"image_key": img_key}})
+            if args.preview:
+                log(f"预览推送完成（报纸图片，{ok} 个群送达），不更新去重状态。")
+                return
+            if ok == 0:
+                log("所有群均推送失败，不更新去重状态（下次重推）。")
+                sys.exit(2)
+            state["seen"].extend(it["link"] for it in items)
+            state["last_push"] = now.isoformat()
+            save_state(state)
+            log(f"报纸图片推送完成，送达 {ok} 个群。")
+            return
+        except Exception as e:
+            log(f"报纸图片上传/推送失败，降级卡片: {e}")
+    else:
+        log(f"报纸生成失败（{_meta}），降级卡片。")
+
+    # 降级路径：交互卡片
     extras = enrich(fresh, cfg, now)
     card = build_card(fresh, cfg, now, extras)
-    total_note = card["elements"][-1]["elements"][0]["content"]
-    n = int(re.search(r"共 (\d+) 条", total_note).group(1)) if re.search(r"共 (\d+) 条", total_note) else 0
-
     ok = send_all(cfg, {"msg_type": "interactive", "card": card})
     if args.preview:
-        log(f"预览推送完成（{n} 条，{ok} 个群送达），不更新去重状态。")
+        log(f"预览推送完成（卡片降级，{ok} 个群送达），不更新去重状态。")
         return
     if ok == 0:
         log("所有群均推送失败，不更新去重状态（下次重推）。")
@@ -695,7 +1000,7 @@ def main():
     state["seen"].extend(it["link"] for it in items)
     state["last_push"] = now.isoformat()
     save_state(state)
-    log(f"推送完成，共 {n} 条，送达 {ok} 个群。")
+    log(f"推送完成（卡片），送达 {ok} 个群。")
 
 
 if __name__ == "__main__":
