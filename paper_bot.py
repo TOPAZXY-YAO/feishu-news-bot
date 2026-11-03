@@ -27,7 +27,8 @@ STATE_FILE = BASE / "paper_state.json"
 WEEKDAYS = "一二三四五六日"
 
 ZHIPU_KEY = os.environ.get("ZHIPU_API_KEY", "")
-LLM_MODELS = ["glm-4-flash-250414", "glm-4.7-flash", "glm-4.5-flash"]  # 与对话机器人同款回退链
+DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+ZHIPU_KEY = os.environ.get("ZHIPU_API_KEY", "")
 SUMMARY_BUDGET_SECONDS = 240  # 概括阶段总预算，超时后剩余条目不再概括
 
 # section: nber / journal / agecon / arxiv；cap 为每次推送每板块上限
@@ -86,8 +87,8 @@ def split_nber(title: str):
 # ---------- AI 论文概括 ----------
 
 def zhipu_summarize(title: str, abstract: str = "", zh: bool = False) -> str:
-    """用智谱免费模型把论文概括成一句中文（45字内）。失败返回空串，不影响推送。"""
-    if not ZHIPU_KEY:
+    """一句话中文概括论文（45字内）。DeepSeek 主力、智谱免费兜底；失败返回空串。"""
+    if not (DEEPSEEK_KEY or ZHIPU_KEY):
         return ""
     if abstract:
         prompt = ("你是经济学研究助理。用一句不超过45字的中文概括这篇论文研究什么、核心发现是什么。"
@@ -101,36 +102,13 @@ def zhipu_summarize(title: str, abstract: str = "", zh: bool = False) -> str:
         prompt = ("你是经济学研究助理。仅根据标题用一句不超过40字的中文概括这篇论文的研究方向。"
                   "无法确定具体结论时只说大致主题，不要编造。直接输出概括本身。\n"
                   f"标题：{title}")
-    last_err = None
-    for model in LLM_MODELS:
-        for attempt in range(2):
-            try:
-                body = {"model": model, "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.3, "max_tokens": 120,
-                        "thinking": {"type": "disabled"}}
-                req = urllib.request.Request(
-                    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-                    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                    headers={"Authorization": f"Bearer {ZHIPU_KEY}",
-                             "Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                out = (data["choices"][0]["message"].get("content") or "").strip()
-                return re.sub(r"\s+", " ", out)[:80]
-            except urllib.error.HTTPError as e:
-                last_err = f"HTTP {e.code}"
-                if e.code == 401:
-                    news.log(f"概括失败：智谱 Key 无效")
-                    return ""
-                if e.code == 429 and attempt < 1:
-                    time.sleep(2)
-                    continue
-                break
-            except Exception as e:
-                last_err = e
-                break
-    news.log(f"概括失败（{title[:30]}…）：{last_err}")
-    return ""
+    try:
+        out = news.llm_complete([{"role": "user", "content": prompt}],
+                                max_tokens=120, temperature=0.3)
+        return re.sub(r"\s+", " ", out)[:80]
+    except Exception as e:
+        news.log(f"概括失败（{title[:30]}…）：{e}")
+        return ""
 
 
 # ---------- 去重状态（独立于新闻机器人） ----------
