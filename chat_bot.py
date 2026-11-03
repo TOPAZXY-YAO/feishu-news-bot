@@ -258,13 +258,14 @@ def send_digest(api: lark.Client, message_id: str) -> None:
             send_reply(api, message_id, "text", {"text": "新闻源暂时抓取失败，稍后再试~"})
             return
         fresh = news.filter_fresh(items, cfg, now)
-        # 报纸图片版优先
+        # 四页报纸图片版优先
         try:
-            path, _meta = news.build_newspaper(fresh, cfg, now)
-            if path:
-                with open(path, "rb") as f:
-                    img_key = news.upload_image_bytes(f.read())
-                send_reply(api, message_id, "image", {"image_key": img_key})
+            paths, _meta = news.build_newspaper(fresh, cfg, now)
+            if paths:
+                for path in paths:
+                    with open(path, "rb") as f:
+                        img_key = news.upload_image_bytes(f.read())
+                    send_reply(api, message_id, "image", {"image_key": img_key})
                 return
         except Exception as e:
             log(f"报纸生成失败（降级卡片）: {e}")
