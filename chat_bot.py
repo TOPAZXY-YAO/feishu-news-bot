@@ -258,7 +258,7 @@ def send_digest(api: lark.Client, message_id: str) -> None:
             send_reply(api, message_id, "text", {"text": "新闻源暂时抓取失败，稍后再试~"})
             return
         fresh = news.filter_fresh(items, cfg, now)
-        # 四页报纸图片版优先
+        # 单页报纸图片版优先
         try:
             paths, _meta = news.build_newspaper(fresh, cfg, now)
             if paths:
