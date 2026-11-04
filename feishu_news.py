@@ -711,7 +711,8 @@ def render_newspaper(materials: list, layout: dict, quotes: list, now: datetime,
 
 
 def build_newspaper(fresh: list, cfg: dict, now: datetime):
-    """完整报纸流水线：素材 → AI 组稿 → 四页渲染。成功返回 (paths, layout)，失败返回 (None, 原因)。"""
+    """完整报纸流水线：素材 → AI 组稿 → 渲染。成功返回 (paths, layout)，失败返回 (None, 原因)。
+    paths[0]=主报（必得），paths[1]=期货版（独立降级，失败则只有主报）。"""
     try:
         materials = build_materials(fresh)
         if not materials:
@@ -721,16 +722,31 @@ def build_newspaper(fresh: list, cfg: dict, now: datetime):
             quotes = fetch_quotes()
         except Exception as e:
             log(f"行情获取失败（报纸无指数条）: {e}")
-        history = []
-        try:
-            import newspaper_pages as npages
-            history = npages.fetch_history()
-        except Exception as e:
-            log(f"K线历史获取失败（走势图降级）: {e}")
         layout = ai_newspaper_full(materials, quotes)
         lead_img = layout["lead"]["item"].get("img_url", "")
-        import newspaper_pages as npages
-        paths = npages.render_pages(materials, layout, quotes, history, now, lead_img)
+        # 单页版式：头条 + 3 条要闻 + 三栏简讯（全球/宏观/行业各2条）+ 解读
+        layout_single = {
+            "lead": layout["lead"],
+            "top": layout["top"][:3],
+            "briefs": (layout.get("market_briefs", [])[:2]
+                       + layout.get("cn_briefs", [])[:2]
+                       + layout.get("industry_briefs", [])[:2]),
+            "comment": layout["comment"],
+        }
+        main_path = render_newspaper(materials, layout_single, quotes, now, lead_img)
+        paths = [main_path]
+        # 期货版（独立流水线，任一步失败只跳过期货版）
+        try:
+            import newspaper_pages as npages
+            fquotes = npages.fetch_futures_quotes()
+            fhistory = npages.fetch_futures_history()
+            headlines = [it["title"] for it in fresh]
+            comment = npages.ai_futures_comment(fquotes, headlines)
+            fpath = npages.render_futures_page(now, fquotes, fhistory, comment, headlines)
+            paths.append(fpath)
+            log(f"期货版已生成（{len(fquotes)} 个品种）")
+        except Exception as e:
+            log(f"期货版生成失败（本次只有主报）: {e}")
         return paths, layout
     except Exception as e:
         return None, f"{type(e).__name__}: {e}"
@@ -988,7 +1004,7 @@ def main():
         log("过滤后无新闻可推，跳过发送（不更新去重状态）。")
         return
 
-    # 主路径：四页报纸图片版
+    # 主路径：报纸图片版（主报 + 期货版）
     paths, _meta = build_newspaper(fresh, cfg, now)
     if paths:
         try:
@@ -997,9 +1013,9 @@ def main():
                 img_key = upload_image_bytes(open(path, "rb").read())
                 ok = send_all(cfg, {"msg_type": "image", "content": {"image_key": img_key}})
                 total_ok += ok
-                log(f"第{i}版推送完成（{ok} 个群）")
+                log(f"第{i}张推送完成（{ok} 个群）")
             if args.preview:
-                log(f"预览推送完成（{len(paths)} 页报纸，累计送达 {total_ok} 次），不更新去重状态。")
+                log(f"预览推送完成（{len(paths)} 张报纸，累计送达 {total_ok} 次），不更新去重状态。")
                 return
             if total_ok == 0:
                 log("所有群均推送失败，不更新去重状态（下次重推）。")
@@ -1007,7 +1023,7 @@ def main():
             state["seen"].extend(it["link"] for it in items)
             state["last_push"] = now.isoformat()
             save_state(state)
-            log(f"报纸推送完成：{len(paths)} 版 × {total_ok // max(len(paths),1)} 个群。")
+            log(f"报纸推送完成：{len(paths)} 张。")
             return
         except Exception as e:
             log(f"报纸图片上传/推送失败，降级卡片: {e}")
