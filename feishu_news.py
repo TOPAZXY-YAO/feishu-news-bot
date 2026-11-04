@@ -735,18 +735,40 @@ def build_newspaper(fresh: list, cfg: dict, now: datetime):
         }
         main_path = render_newspaper(materials, layout_single, quotes, now, lead_img)
         paths = [main_path]
-        # 期货版（独立流水线，任一步失败只跳过期货版）
+        headlines = [it["title"] for it in fresh]
+        # 期货版（独立流水线，任一步失败只跳过该版）
         try:
             import newspaper_pages as npages
             fquotes = npages.fetch_futures_quotes()
             fhistory = npages.fetch_futures_history()
-            headlines = [it["title"] for it in fresh]
             comment = npages.ai_futures_comment(fquotes, headlines)
             fpath = npages.render_futures_page(now, fquotes, fhistory, comment, headlines)
             paths.append(fpath)
             log(f"期货版已生成（{len(fquotes)} 个品种）")
         except Exception as e:
             log(f"期货版生成失败（本次只有主报）: {e}")
+        # 加密货币版（独立降级）
+        try:
+            import market_pages as mpages
+            cquotes = mpages.fetch_crypto_quotes()
+            btc = mpages.fetch_crypto_history("bitcoin")
+            eth = mpages.fetch_crypto_history("ethereum")
+            ccomment = mpages.ai_crypto_comment(cquotes, headlines)
+            cpath = mpages.render_crypto_page(now, cquotes, btc, eth, ccomment)
+            paths.append(cpath)
+            log(f"加密货币版已生成（{len(cquotes)} 个币种）")
+        except Exception as e:
+            log(f"加密版生成失败（本次缺）: {e}")
+        # 全球国债版（独立降级）
+        try:
+            yields = mpages.fetch_bond_yields()
+            curve = mpages.fetch_fred_curve()
+            bcomment = mpages.ai_bonds_comment(yields, headlines)
+            bpath = mpages.render_bonds_page(now, yields, curve, bcomment)
+            paths.append(bpath)
+            log(f"全球国债版已生成（{len(yields)} 国）")
+        except Exception as e:
+            log(f"国债版生成失败（本次缺）: {e}")
         return paths, layout
     except Exception as e:
         return None, f"{type(e).__name__}: {e}"
